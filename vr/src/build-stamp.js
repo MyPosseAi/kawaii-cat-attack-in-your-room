@@ -9,7 +9,7 @@
      2) version.json = { version, builtAt, commit } written next to index.html (emitFile; never hashed, never cached:
         dev-update.js polls it with cache 'no-store'). The dev server serves the same JSON from memory.
      3) The flat preview card's address: `{{PLAY_URL}}` in index.html is filled from env PLAY_URL (must be an https URL;
-        default = the GitHub Pages URL) and shown WITHOUT the scheme ("myposseai.github.io/...") as plain text, never a link:
+        default = the Pages build's custom domain play.kawaiicatattack.com, item 1) and shown WITHOUT the scheme as plain text, never a link:
         the frozen page may carry no absolute URL at all (Legal 13.6 item 6) and it is an address to type into the headset.
    FROZEN build (`npm run build:freeze`, src/freeze-guard.js isContestFreeze): jobs 1 and 2 are OFF. The stamp element, the
    dev-update script tag, the dev CSS and the dev start-card sentence are CUT by freezeIndexHtml (FREEZE_CUTS) before this
@@ -22,8 +22,9 @@ import { isContestFreeze } from './freeze-guard.js';
 
 export const PLAY_URL_ENV = 'PLAY_URL';
 export const PLAY_URL_PLACEHOLDER = '{{PLAY_URL}}';
-/** The public Pages build (the ONE playable link, Legal 13.1 (a)). Override with env PLAY_URL (e.g. the play. subdomain, item 1). */
-export const DEFAULT_PLAY_URL = 'https://myposseai.github.io/kawaii-cat-attack-in-your-room/';
+/** The public Pages build (the ONE playable link, Legal 13.1 (a)) at its custom domain (item 1, live 2026-10-10; the old
+    myposseai.github.io address redirects here). Override with env PLAY_URL. */
+export const DEFAULT_PLAY_URL = 'https://play.kawaiicatattack.com/';
 export const COMMIT_ENVS = Object.freeze(['KCA_COMMIT', 'GITHUB_SHA']);
 export const VERSION_FILE = 'version.json';
 export const STAMP_ID = 'build-stamp';

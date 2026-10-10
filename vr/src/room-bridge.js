@@ -137,12 +137,52 @@ export function buildRoomInput(scene, viewer, forward, floorY) {
   };
 }
 
-/** Change key of a scene snapshot: ids + lastChangedTime of every plane / mesh (cheap; no geometry compare). */
-export function sceneKey(scene) {
-  const part = (list, tag) => (list || []).map((o) => `${tag}:${o.id}:${o.lastChangedTime == null ? '' : Math.round(o.lastChangedTime)}`).sort().join('|');
-  return part(scene && scene.planes, 'p') + '#' + part(scene && scene.meshes, 'm');
+/** Scene settle = "nothing in the room has MOVED, GROWN or APPEARED since the last accepted snapshot", judged with a tolerance,
+ *  never by bins and never by the runtime's bookkeeping (lastChangedTime / ids): IWER re-stamps its planes every frame (CI #10:
+ *  the old id + lastChangedTime key changed every frame = 8 s 'timeout' every run) and a Quest pose can carry sub-mm noise (a
+ *  rounded / binned key flips at every bin edge: Review BZ M1). sceneSignature(scene) -> per object { tag, label, orientation,
+ *  n, pos, basis, bounds, centroid } (plane: polygon count + plane-space bounds + centroid; mesh: vertex count + mesh-space
+ *  bounds + centroid; pose from the matrix). sceneDiffers(accepted, next, tol) is true when the counts differ, or any object of
+ *  `next` has no still-unmatched partner in `accepted` with the same tag / label / orientation / count whose pos, bounds and
+ *  centroid all stay within tol.posM (2 cm) and whose basis stays within tol.rotSin (0.05 = ~3 degrees per axis vector).
+ *  The bridge re-anchors (accepts the new snapshot + restarts the settle clock) ONLY on a difference, so jitter around any value
+ *  never counts, while a slow creep DOES count once its cumulative drift from the ACCEPTED snapshot exceeds the tolerance
+ *  (documented choice: 1 mm/frame creep re-anchors at the ~20th frame, then again 20 frames later, so a plane that keeps
+ *  sliding never settles; a plane that stops does, 1 s after its last re-anchor). Real refinements (growth / move >= 2 cm, a
+ *  new or dropped plane, a new label) restart the settle as before; the 8 s / 3 s fallbacks are unchanged. */
+export const SCENE_TOL = Object.freeze({ posM: 0.02, rotSin: 0.05 });
+export function sceneSignature(scene) {
+  const bounds3 = (each) => {
+    let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity, sx = 0, sy = 0, sz = 0, k = 0;
+    each((x, y, z) => { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; if (z < z0) z0 = z; if (z > z1) z1 = z; sx += x; sy += y; sz += z; k++; });
+    return k ? { bounds: [x0, y0, z0, x1, y1, z1], centroid: [sx / k, sy / k, sz / k], k } : { bounds: null, centroid: null, k: 0 };
+  };
+  const sig = (o, tag) => {
+    const m = o.matrix && o.matrix.length >= 16 ? o.matrix : null;
+    const g = o.polygon ? bounds3((f) => { for (const v of o.polygon) f(v.x, v.y, v.z); })
+      : o.vertices ? bounds3((f) => { const a = o.vertices; for (let i = 0; i + 2 < a.length; i += 3) f(a[i], a[i + 1], a[i + 2]); }) : bounds3(() => {});
+    return { tag, label: String(o.label || ''), orientation: String(o.orientation || ''), n: o.polygon ? o.polygon.length : o.vertices ? o.vertices.length : 0,
+      pos: m ? [m[12], m[13], m[14]] : null, basis: m ? [m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]] : null, bounds: g.bounds, centroid: g.centroid };
+  };
+  const planes = ((scene && scene.planes) || []).map((o) => sig(o, 'p')), meshes = ((scene && scene.meshes) || []).map((o) => sig(o, 'm'));
+  return planes.concat(meshes);
 }
-
+/** True when `next` is not the same room as `accepted` within tol (see above). Either may be null (= differs unless both are). */
+export function sceneDiffers(accepted, next, tol = SCENE_TOL) {
+  if (!accepted || !next) return accepted !== next;
+  if (accepted.length !== next.length) return true;
+  const within = (a, b, e) => { if (a === b) return true; if (!a || !b || a.length !== b.length) return false; for (let i = 0; i < a.length; i++) if (!(Math.abs(a[i] - b[i]) <= e)) return false; return true; };
+  const same = (a, b) => a.tag === b.tag && a.label === b.label && a.orientation === b.orientation && a.n === b.n &&
+    within(a.pos, b.pos, tol.posM) && within(a.basis, b.basis, tol.rotSin) && within(a.bounds, b.bounds, tol.posM) && within(a.centroid, b.centroid, tol.posM);
+  const used = new Array(accepted.length).fill(false);
+  for (const o of next) {
+    let hit = -1;
+    for (let i = 0; i < accepted.length; i++) if (!used[i] && same(accepted[i], o)) { hit = i; break; }
+    if (hit < 0) return true;
+    used[hit] = true;
+  }
+  return false;
+}
 // ---------------------------------------------------------------- 2. gestures -> events, state -> billboards (pure)
 
 /** Ray (o, d) vs the vertical quad above segment a-b between heights lo and hi: the ray parameter t at the crossing, or null. */
@@ -377,22 +417,24 @@ export function createRoomBridge(opts = {}) {
   const onLog = typeof opts.onLog === 'function' ? opts.onLog : null;
   const b = {
     ready: false, reason: null, room: null, session: null, state: null, rescans: 0, roomInput: null,
+    sceneChanges: 0, // observe(): how often the accepted snapshot was re-anchored before start() (smoke diagnostic: why 'timeout' / late 'settled')
     gestures: {}, views: {}, loop: createFixedLoop({ stepMs: STEP_MS, maxStepsPerFrame: 5, maxFrameMs: 250 }),
     // W3: wand / hints / captions / end card (all plain data from the pure modules)
     wand: null, progress: createProgress(), hints: createHintState(), captions: createCaptionState(), hint: null, caption: null, endCard: null, memory: null, time: 0,
     // P0a slice: the director (game beats + meter + Laser Tag) and fx (juice, particles, cues); slice = the 3-minute pacing
     director: null, fx: null, slice: opts.slice !== false, simEvents: [], ltCats: [], ltViews: {},
-    _firstT: null, _key: null, _keyT: null, _lastScene: null, _lastViewer: null, _lastForward: null, _lastFloorY: 0, _liveKey: null,
+    _firstT: null, _accepted: null, _keyT: null, _lastScene: null, _lastViewer: null, _lastForward: null, _lastFloorY: 0, _liveAccepted: null,
     _scratch: {}, _prevState: null, _fxPrev: null, _gest: [], _empty: [], _ltState: { cats: [] },
   };
   for (const h of T.hands) b.gestures[h] = createGestureState(h);
 
   b.observe = (scene, viewer, forward, floorY, t) => {
-    const key = sceneKey(scene);
-    const n = (scene.planes ? scene.planes.length : 0) + (scene.meshes ? scene.meshes.length : 0);
-    if (b.session) { if (key !== b._liveKey) { b._liveKey = key; b.rescans++; if (onLog) onLog(`room changed mid-session (${n} objects), applied on the next session`); } return; }
+    const sig = sceneSignature(scene);
+    const n = sig.length;
+    // after start(): only a host that keeps calling observe() (session-life.js does not today) feeds `rescans`; log only, the room stays frozen
+    if (b.session) { if (sceneDiffers(b._liveAccepted, sig)) { b._liveAccepted = sig; b.rescans++; if (onLog) onLog(`room changed mid-session (${n} objects), applied on the next session`); } return; }
     if (b._firstT == null) b._firstT = t;
-    if (key !== b._key) { b._key = key; b._keyT = t; }
+    if (sceneDiffers(b._accepted, sig)) { b._accepted = sig; b._keyT = t; b.sceneChanges++; } // re-anchor only on a real change (tolerance, no bins)
     b._lastScene = scene; b._lastViewer = viewer; b._lastForward = forward; b._lastFloorY = floorY;
     const since = t - b._firstT, stable = t - b._keyT;
     if (n > 0 && stable >= T.settleS) { b.ready = true; b.reason = 'settled'; }
@@ -404,7 +446,7 @@ export function createRoomBridge(opts = {}) {
     const input = buildRoomInput(b._lastScene || { planes: [], meshes: [] }, b._lastViewer, b._lastForward, b._lastFloorY);
     b.roomInput = input;
     b.room = createRoom(input);
-    b._liveKey = b._key;
+    b._liveAccepted = b._accepted;
     // W4 kitten memory (return-visit.js): a remembered kitten heads to its favourite spot in THIS room (matched by label)
     let cats = opts.cats == null ? 3 : opts.cats;
     if (opts.memory && Array.isArray(cats)) {
@@ -520,7 +562,7 @@ export function createRoomBridge(opts = {}) {
   b.openBox = () => { if (b.session) b.session.openBox(); };
   b.dispose = () => {
     b.session = null; b.room = null; b.state = null; b.roomInput = null; b.ready = false; b.reason = null; b.disposed = true;
-    b._firstT = null; b._key = null; b._keyT = null; b._lastScene = null; b._liveKey = null; b.views = {};
+    b._firstT = null; b._accepted = null; b._keyT = null; b._lastScene = null; b._liveAccepted = null; b.views = {};
     b.wand = null; b.hint = null; b.caption = null; b.endCard = null; b.memory = null; b._prevState = null; b._fxPrev = null; b.time = 0;
     b.director = null; b.fx = null; b.simEvents.length = 0; b.ltCats.length = 0;
     for (const h of T.hands) b.gestures[h] = createGestureState(h);

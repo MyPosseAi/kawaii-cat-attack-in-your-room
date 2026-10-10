@@ -123,6 +123,8 @@ class RoomCatSystem extends createSystem({
       const floorOf = (b) => { const f = b && b.room ? b.room.surfaces.find((s) => s.kind === 'floor') : null; return f ? { id: f.id, y: f.y, virtual: !!f.virtual } : null; };
       window.__kcaSmoke = {
         source: () => { const b = bridge(); return b ? b.reason : null; },        // 'settled' | 'no_scan' | 'timeout' | null
+        sceneChanges: () => { const b = bridge(); return b ? b.sceneChanges : null; }, // scene-key changes seen by observe() before start()
+        furniture: () => { const b = bridge(); return b && b.roomInput ? b.roomInput.meshes.map((m) => ({ id: m.id, label: m.label, min: m.min, max: m.max, footprint: m.footprint || null })) : []; }, // world AABB + XZ hull per furniture mesh (smoke: no cat inside furniture)
         planes: () => { const b = bridge(); return b && b.roomInput ? b.roomInput.planes.length : 0; },
         meshes: () => { const b = bridge(); return b && b.roomInput ? b.roomInput.meshes.length : 0; },
         floorY: () => { const f = floorOf(bridge()); return f ? f.y : null; },
