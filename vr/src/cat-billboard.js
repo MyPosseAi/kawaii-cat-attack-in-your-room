@@ -19,6 +19,7 @@ import {
 } from 'three';
 
 export const KITTEN_HEIGHT_M = 0.28; // ~1 kitten body length tall incl. ears (plan 2.3: 0.18 m BL)
+import { ART_SCALE } from './art-glue.js'; // P0a: Design's atlas frames scaled to this kitten height
 
 /** Placeholder per view: side (the W1 drawing), front / back (round face or tail end), above / below (top-down loaf
  *  pointing RIGHT, belly + paw pads from below). Poses only squash / lean (cat-billboard apply()). Original shapes. */
@@ -186,18 +187,29 @@ export function createCatBillboard(opts = {}) {
 
   const view = { sprite: 'side', flipX: false, rotDeg: 0, tiltDeg: 0 };
   let pose = 'sit';
+  let jx = 1, jy = 1; // P0a juice (fx.js juiceStep): squash & stretch multipliers, applied about the paws
+  let frame = null;   // P0a atlas mode (Design's VR1 sprites): the current atlas frame { sizeM, centerM, liftM, flipX, uv }
   const apply = () => {
-    const squash = pose === 'nap' || pose === 'loaf' ? 0.62 : pose === 'crouch' || pose === 'eat' ? 0.8 : pose === 'stare' || pose === 'beg' ? 1.08 : 1;
     const lean = pose === 'carried' ? 18 : pose === 'poof' ? -12 : pose === 'fall' ? 8 : 0;
+    if (frame) {
+      // atlas mode: the frame is already the pose's drawing (flip baked into its UVs); only the juice squashes it, about the paws
+      const w = frame.sizeM[0] * ART_SCALE / KITTEN_HEIGHT_M, h = frame.sizeM[1] * ART_SCALE / KITTEN_HEIGHT_M;
+      quad.scale.set(w * jx, h * jy, 1);
+      quad.position.set(frame.centerM[0] * ART_SCALE * jx, (frame.centerM[1] * ART_SCALE + frame.liftM) * jy, 0);
+      quad.rotation.set(-view.tiltDeg * DEG2RAD, 0, (-view.rotDeg + lean) * DEG2RAD);
+      return;
+    }
+    const squash = (pose === 'nap' || pose === 'loaf' ? 0.62 : pose === 'crouch' || pose === 'eat' ? 0.8 : pose === 'stare' || pose === 'beg' ? 1.08 : 1) * jy;
     for (const q of [quad, fadeQuad]) {
-      q.scale.set(view.flipX ? -1 : 1, squash, 1);
-      q.position.y = (KITTEN_HEIGHT_M * squash) / 2;
+      q.scale.set((view.flipX ? -1 : 1) * jx, squash, 1);
+      q.position.set(0, (KITTEN_HEIGHT_M * squash) / 2, q === fadeQuad ? -0.001 : 0);
       q.rotation.set(-view.tiltDeg * DEG2RAD, 0, (-view.rotDeg + lean) * DEG2RAD);
     }
   };
+  const uvAttr = quad.geometry.attributes.uv;
   /** W3: pick the texture for (sprite, pose) through cat-sprites and run the crossfade (nowMs from the host clock) */
   const setSprite = (nowMs) => {
-    if (!cache) return;
+    if (!cache || frame) return;
     const r = resolveSprite({ sprite: view.sprite, pose, size: catSize, catId });
     if (!r) return;
     fader = faderStep(fader, r.key, nowMs);
@@ -215,6 +227,23 @@ export function createCatBillboard(opts = {}) {
     root, quad, shadow,
     setView(v) { view.sprite = v.sprite; view.flipX = !!v.flipX; view.rotDeg = v.rotDeg || 0; view.tiltDeg = v.tiltDeg || 0; apply(); },
     setPose(p) { if (p !== pose) { pose = p; apply(); } },
+    /** P0a: squash & stretch (sx wider, sy taller) from fx.js; cheap when unchanged */
+    setSquash(sx, sy) { if (Math.abs(sx - jx) > 1e-4 || Math.abs(sy - jy) > 1e-4) { jx = sx; jy = sy; apply(); } },
+    /** P0a atlas mode: show atlas frame f (vr/src/art/atlas.js getFrame) from texture tex (one per cat atlas file). The quad's UVs
+     *  become the frame's rect (flip included), its size / offset the frame's metres; the crossfade quad is parked. null = back
+     *  to the canvas sprites. Cheap when the same frame index repeats. */
+    setAtlasFrame(f, tex) {
+      if (!f) { if (frame) { frame = null; quad.material.opacity = 1; uvAttr.setXY(0, 0, 1); uvAttr.setXY(1, 1, 1); uvAttr.setXY(2, 0, 0); uvAttr.setXY(3, 1, 0); uvAttr.needsUpdate = true; fader = createFader(cache ? `${catId}:${catSize}:side:sit` : null, 0); apply(); } return; }
+      const same = frame && frame.file === f.file && frame.index === f.index && frame.view === f.view && frame.anim === f.anim && frame.flipX === f.flipX && frame.lod === f.lod;
+      frame = f;
+      if (quad.material.map !== tex) { quad.material.map = tex; quad.material.needsUpdate = true; quad.material.opacity = 1; fadeQuad.visible = false; }
+      if (!same) {
+        const u = f.uv; // PlaneGeometry vertex order: top-left, top-right, bottom-left, bottom-right
+        uvAttr.setXY(0, u.u0, u.v1); uvAttr.setXY(1, u.u1, u.v1); uvAttr.setXY(2, u.u0, u.v0); uvAttr.setXY(3, u.u1, u.v0); uvAttr.needsUpdate = true;
+        apply();
+      }
+    },
+    get atlasMode() { return !!frame; },
     /** W3: call after setView / setPose each frame with the host clock in ms */
     update(nowMs) { setSprite(nowMs); },
     setShadow(y, alpha) {

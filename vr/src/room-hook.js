@@ -11,15 +11,45 @@
 // W3 (GE2): the feather wand + toy basket (wand.js state -> a stick, a feather, a basket), the head-locked hint /
 // caption card and the end card (hints.js / end-card.js data -> one CanvasTexture card), per-sprite textures through
 // cat-billboard's shared cache. Still only three + the bridge's plain data.
-import { BoxGeometry, CanvasTexture, CircleGeometry, CylinderGeometry, DoubleSide, Group, Mesh, MeshBasicMaterial, PlaneGeometry, SRGBColorSpace, Vector3 } from 'three';
+// P0a slice (docs/P0A-SLICE.md GE2): the lid swings open on a hinge, the box thumps / jiggles (fx.js boxAnim), hearts /
+// dust / sparks are three InstancedMeshes fed by the fx.js pools (2 + 1 draw calls, fixed size), the Kitten Happiness
+// meter is two quads over the hint card, the Laser Tag dot is a white core + coral #ff7a6b ring (audit 3.2 read rule), the
+// score card reuses the end-card canvas, and every billboard gets fx.js's squash & stretch. Sprite drawing comes through
+// cat-art.js (Design's atlas loader registers itself there; placeholder until then).
+import { BoxGeometry, CanvasTexture, CircleGeometry, CylinderGeometry, DoubleSide, Group, InstancedMesh, Mesh, MeshBasicMaterial, Object3D, PlaneGeometry, RingGeometry, SRGBColorSpace, Vector3 } from 'three';
 const UP = new Vector3(0, 1, 0), tmpV = new Vector3();
 import { createCatBillboard, createSpriteCache } from './cat-billboard.js';
 import { createRoomBridge } from './room-bridge.js';
 import { WAND_TUNING } from './wand.js';
+import { boxAnim, FX_TUNING } from './fx.js';
+import { catArtDraw } from './cat-art.js';
+// P0a: Design's VR1 sprites (vr/public/art, loader vr/src/art/atlas.js) through the bundled slim manifest (no fetch; the
+// PNG atlases are build files loaded by three's TextureLoader). hi for the 3 nearest kittens, lo for the rest (pickLod).
+import { createAtlas, pickLod } from './art/atlas.js';
+import { ART_MANIFEST } from './art-manifest.gen.js';
+import { artIdOf, artPose, boxFaceUV, createResidency } from './art-glue.js';
+import { LT_ROOM_STARTERS } from '../../game/core/lasertag-room.js';
+import { HAPPY_TUNING } from './director.js';
+import { ImageLoader, LinearFilter, Texture } from 'three';
 
 const BOX_SIZE_M = 0.28; // roomcat: boxR 0.14, boxH 0.3
 const CARD_W = 0.42, CARD_H = 0.12, CARD_AHEAD = 0.9, CARD_BELOW = 0.22; // head-locked hint card (metres)
 const END_W = 0.6, END_H = 0.42;
+const METER_W = 0.3, METER_H = 0.022, METER_ABOVE = 0.09; // the Happiness bar sits this far above the hint card's centre
+const ART_BASE = './art/'; // vr/public/art -> dist/art (vite publicDir), relative like every other build file (base './')
+/** a small canvas texture: heart / soft disc / spark (original shapes, no brands) */
+function particleTexture(kind) {
+  const px = 64, canvas = document.createElement('canvas'); canvas.width = canvas.height = px;
+  const ctx = canvas.getContext('2d'); ctx.clearRect(0, 0, px, px);
+  if (kind === 'heart') {
+    ctx.fillStyle = '#ff9ec7'; ctx.beginPath(); ctx.moveTo(32, 58); ctx.bezierCurveTo(6, 38, 2, 16, 18, 10); ctx.bezierCurveTo(26, 7, 32, 14, 32, 20); ctx.bezierCurveTo(32, 14, 38, 7, 46, 10); ctx.bezierCurveTo(62, 16, 58, 38, 32, 58); ctx.closePath(); ctx.fill();
+  } else if (kind === 'dust') {
+    const g = ctx.createRadialGradient(32, 32, 4, 32, 32, 30); g.addColorStop(0, 'rgba(255,243,230,0.9)'); g.addColorStop(1, 'rgba(255,243,230,0)'); ctx.fillStyle = g; ctx.fillRect(0, 0, px, px);
+  } else {
+    ctx.fillStyle = '#ffe08a'; ctx.beginPath(); for (let i = 0; i < 8; i++) { const a = i * Math.PI / 4, r = i % 2 ? 10 : 28; ctx.lineTo(32 + Math.cos(a) * r, 32 + Math.sin(a) * r); } ctx.closePath(); ctx.fill();
+  }
+  const tex = new CanvasTexture(canvas); tex.colorSpace = SRGBColorSpace; return tex;
+}
 
 /** A text card on a quad (original look: dark rounded panel, pale text). lines = string[]. */
 function makeCard(w, h, px) {
@@ -58,7 +88,55 @@ export function createRoomHook(opts = {}) {
   const group = new Group();
   group.name = 'kca-room';
   const cats = new Map(); // cat id -> billboard
-  const cache = createSpriteCache({ draw: opts.draw }); // W3: one texture per (cat, view, pose), shared by the billboards
+  const cache = createSpriteCache({ draw: opts.draw || catArtDraw() || undefined }); // W3: one texture per (cat, view, pose), shared by the billboards (the fallback when a cat has no atlas art)
+  // P0a: Design's atlas sprites, 7 sheets per kitten (review BC MUST 2 + Design's 11:2x asks). Two layers:
+  //   images: every sheet (hi + lo) a kitten can need is fetched and DECODED upfront at hook creation (today's kittens + the Laser
+  //           Tag starters + the box) into a CPU image cache: no network and no decode mid-play;
+  //   GPU:    a sheet becomes a Texture only when first drawn (the upload of a decoded image), the residency LRU (art-glue
+  //           createResidency) keeps the GPU at <= 8 MB incl. the box and frees any sheet not drawn for ~1 s. A sheet whose image
+  //           is not decoded yet (first seconds) or that cannot fit draws the other lod, else the canvas sprite.
+  const atlas = opts.atlas === null ? null : createAtlas(opts.atlas || ART_MANIFEST);
+  const M = atlas ? atlas.manifest : null;
+  const images = new Map();   // file -> HTMLImageElement (decoded) | 'loading'
+  const atlasTex = new Map(); // file -> Texture (GPU resident)
+  const residency = createResidency(8 * 1024 * 1024, 1.0);
+  const sheetBytes = (file) => (/\.lo\.png$/.test(file) ? M.lods.lo.gpuBytesPerCat : M.lods.hi.gpuBytesPerCat);
+  const imgLoader = typeof document !== 'undefined' ? new ImageLoader() : null;
+  function preloadImage(file) {
+    if (!imgLoader || images.has(file)) return;
+    images.set(file, 'loading');
+    // decode upfront into an ImageBitmap when the browser has it (its pixels stay decoded; an <img> may drop them under memory
+    // pressure and decode again at upload time: review BF S2b), else a decoded <img>
+    imgLoader.load(ART_BASE + file, (img) => {
+      const keep = (bmp) => images.set(file, bmp);
+      if (typeof createImageBitmap === 'function') createImageBitmap(img, { colorSpaceConversion: 'none', premultiplyAlpha: 'none' }).then(keep, () => { if (img && typeof img.decode === 'function') img.decode().then(() => keep(img), () => keep(img)); else keep(img); });
+      else if (img && typeof img.decode === 'function') img.decode().then(() => keep(img), () => keep(img)); else keep(img);
+    }, undefined, () => images.delete(file));
+  }
+  const todayIds = (opts.cats || []).map((c) => artIdOf(c && c.id != null ? c.id : c)).filter((id) => atlas && atlas.resolveCat(id));
+  const ltIds = atlas ? LT_ROOM_STARTERS.slice(0, HAPPY_TUNING.ltCats).filter((id) => atlas.resolveCat(id)) : [];
+  if (atlas) for (const id of [...todayIds, ...ltIds]) for (const lod of ['lo', 'hi']) for (const f of atlas.sheetFiles(id, lod)) preloadImage(f);
+  /** the RESIDENT texture for a sheet, uploading it from the decoded image if the budget allows; null = draw something else */
+  let uploadsThisFrame = 0, uploads = 0; // review BF S2a: at most one GPU upload per frame (the others draw the other lod / canvas for a frame)
+  function atlasTexture(file, tNowS) {
+    let t = atlasTex.get(file);
+    if (t) { residency.touch(file, 0, tNowS); return t; }
+    const img = images.get(file);
+    if (!img || img === 'loading' || uploadsThisFrame >= 1) return null;
+    const evicted = residency.touch(file, sheetBytes(file), tNowS);
+    if (evicted === null) return null; // no room: the frame's upload slot stays free for this kitten's lo sheet (review BI S2)
+    uploadsThisFrame++; uploads++;
+    for (const f of evicted) freeTexture(f, true);
+    t = new Texture(img); t.colorSpace = SRGBColorSpace; t.generateMipmaps = false; t.minFilter = LinearFilter; t.magFilter = LinearFilter; t.needsUpdate = true;
+    if (opts.renderer && typeof opts.renderer.initTexture === 'function') { try { opts.renderer.initTexture(t); } catch (e) { /* upload at first draw */ } }
+    atlasTex.set(file, t);
+    return t;
+  }
+  function freeTexture(file, keepBook) { const t = atlasTex.get(file); if (t) { t.dispose(); atlasTex.delete(file); } if (!keepBook) residency.drop(file); }
+  function evictStale(tNowS) { for (const f of residency.stale(tNowS)) { freeTexture(f, true); residency.drop(f); } }
+  const anim = new Map(); // billboard id -> { key, since, x, z, t, speed, lod }
+  const seenScratch = new Set(); // reused every frame (review BF S4)
+  let lodT = -Infinity;
   let disposed = false;
   const now = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
 
@@ -74,20 +152,70 @@ export function createRoomHook(opts = {}) {
   const endCard = makeCard(END_W, END_H, 768); group.add(endCard.mesh);
   let cardLines = '';
 
-  const box = new Mesh(
-    new BoxGeometry(BOX_SIZE_M, BOX_SIZE_M * 1.07, BOX_SIZE_M),
-    new MeshBasicMaterial({ color: 0xc8a165 }),
-  );
-  box.visible = false;
-  group.add(box);
-  const lid = new Mesh(new BoxGeometry(BOX_SIZE_M, 0.01, BOX_SIZE_M), new MeshBasicMaterial({ color: 0xb08a50 }));
-  lid.position.y = BOX_SIZE_M * 1.07 / 2;
-  box.add(lid);
+  const BOX_H = BOX_SIZE_M * 1.07;
+  const box = new Group(); box.visible = false; group.add(box); // origin = the box's bottom centre on its spot
+  // Design's brand box (box/box.png faces): side_a toward the player (+z), side_b on the other walls, top_closed under the flaps,
+  // inner_wall / inner_floor (the pink blanket) on the inside; plain cardboard colours when the art is missing
+  const boxFile = atlas && atlas.boxFace('side_a') ? atlas.boxFace('side_a').file : null;
+  if (boxFile) preloadImage(boxFile);
+  let boxArt = boxFile ? atlasTexture(boxFile, 0) : null; // usually still decoding here: sync() swaps the art in when it lands
+  let boxFreed = false;
+  const boxMat = boxFile ? new MeshBasicMaterial({ map: boxArt, color: 0xc8a165 }) : new MeshBasicMaterial({ color: 0xc8a165 }); // cardboard colour until the art decodes (map x colour: set the colour white once the map lands)
+  const bodyGeom = new BoxGeometry(BOX_SIZE_M, BOX_H, BOX_SIZE_M);
+  if (boxFile) { const A = atlas.boxFace('side_a').uv, B = atlas.boxFace('side_b').uv, T = atlas.boxFace('top_closed').uv; [B, B, T, T, A, B].forEach((uv, i) => boxFaceUV(bodyGeom, i, uv)); }
+  const boxBody = new Mesh(bodyGeom, boxMat);
+  boxBody.position.y = BOX_H / 2; box.add(boxBody);
+  const innerGeom = new BoxGeometry(BOX_SIZE_M * 0.92, BOX_H * 0.9, BOX_SIZE_M * 0.92);
+  if (boxFile) { const W = atlas.boxFace('inner_wall').uv, F = atlas.boxFace('inner_floor').uv; [W, W, F, F, W, W].forEach((uv, i) => boxFaceUV(innerGeom, i, uv)); }
+  const boxInner = new Mesh(innerGeom, boxFile ? new MeshBasicMaterial({ map: boxArt, side: DoubleSide, color: 0xc8a165 }) : new MeshBasicMaterial({ color: 0x6b4a3a, side: DoubleSide })); // the inside, seen once the flaps are up
+  boxInner.position.y = BOX_H * 0.5; boxInner.visible = false; box.add(boxInner);
+  // two cardboard flaps hinged on the back / front top edges: each a thin box whose pivot group sits on the edge (hinge = the art's top edge)
+  const flaps = [];
+  for (const sgn of [-1, 1]) {
+    const pivot = new Group(); pivot.position.set(0, BOX_H, sgn * BOX_SIZE_M / 2); box.add(pivot);
+    const fg = new BoxGeometry(BOX_SIZE_M, 0.01, BOX_SIZE_M / 2);
+    if (boxArt) { const Fl = atlas.boxFace('flap').uv; for (let i = 0; i < 6; i++) boxFaceUV(fg, i, Fl); }
+    const flap = new Mesh(fg, boxArt ? boxMat : new MeshBasicMaterial({ color: 0xb08a50 }));
+    flap.position.z = -sgn * BOX_SIZE_M / 4; pivot.add(flap); flaps.push({ pivot, sgn });
+  }
+  const boxOut = { jiggle: 0, squash: 0, lid: 0 };
+  let playDotAlpha = 0, lastSyncMs = now();
+  // the Laser Tag start target: a soft coral ring on the floor ahead while the offer / score card stands. STATIC (no swell):
+  // every brightness change near the kittens is counted by the fx limiter (review BB MUST 3), so the ring makes none
+  const targetRing = new Mesh(new RingGeometry(0.16, 0.2, 40), new MeshBasicMaterial({ color: 0xff7a6b, transparent: true, opacity: 0.5, depthWrite: false, side: DoubleSide }));
+  targetRing.rotation.x = -Math.PI / 2; targetRing.visible = false; group.add(targetRing);
 
-  const laser = new Mesh(new CircleGeometry(0.02, 16), new MeshBasicMaterial({ color: 0xff2040, transparent: true, opacity: 0.9, depthWrite: false }));
-  laser.rotation.x = -Math.PI / 2;
-  laser.visible = false;
-  group.add(laser);
+  // the dot: a white core with a soft CORAL ring (#ff7a6b: R share 0.53, no saturated red per Legal / plan 17.3) on a dark
+  // halo (light floors); the Play laser and the Laser Tag dot share it. Size scales with the distance to the head (>= 0.6 deg, audit 3.2)
+  const laser = new Group(); laser.visible = false; group.add(laser);
+  const dotHalo = new Mesh(new CircleGeometry(0.03, 20), new MeshBasicMaterial({ color: 0x1d1626, transparent: true, opacity: 0.35, depthWrite: false }));
+  const dotRing = new Mesh(new RingGeometry(0.012, 0.022, 20), new MeshBasicMaterial({ color: 0xff7a6b, transparent: true, opacity: 0.95, depthWrite: false }));
+  const dotCore = new Mesh(new CircleGeometry(0.011, 16), new MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.95, depthWrite: false }));
+  for (const m of [dotHalo, dotRing, dotCore]) { m.rotation.x = -Math.PI / 2; laser.add(m); }
+  dotRing.position.y = 0.001; dotCore.position.y = 0.002;
+
+  // particles: one InstancedMesh per kind, instance count = the fx pool size (fixed, never grows); unused instances scale to 0
+  const dummy = new Object3D();
+  const pools = {};
+  for (const kind of ['heart', 'dust', 'spark']) {
+    const n = kind === 'heart' ? FX_TUNING.heartsMax : kind === 'dust' ? FX_TUNING.dustMax : FX_TUNING.sparkMax;
+    const im = new InstancedMesh(new PlaneGeometry(1, 1), new MeshBasicMaterial({ map: particleTexture(kind), transparent: true, depthWrite: false, side: DoubleSide, alphaTest: 0.02 }), n);
+    im.frustumCulled = false; im.renderOrder = 10; im.count = n;
+    dummy.position.set(0, -10, 0); dummy.scale.set(0, 0, 0); dummy.rotation.set(0, 0, 0); dummy.updateMatrix();
+    for (let i = 0; i < n; i++) im.setMatrixAt(i, dummy.matrix);
+    im.instanceMatrix.needsUpdate = true; group.add(im); pools[kind] = im;
+  }
+  // Kitten Happiness meter: a dark track + a pink fill (scaled in x from its left end) + a tiny label card, head-locked
+  const meter = new Group(); meter.visible = false; group.add(meter);
+  const track = new Mesh(new PlaneGeometry(METER_W, METER_H), new MeshBasicMaterial({ color: 0x1d1626, transparent: true, opacity: 0.75, depthTest: false, depthWrite: false, side: DoubleSide }));
+  const fill = new Mesh(new PlaneGeometry(METER_W, METER_H * 0.7), new MeshBasicMaterial({ color: 0xff9ec7, depthTest: false, depthWrite: false, side: DoubleSide }));
+  fill.geometry.translate(METER_W / 2, 0, 0); fill.position.set(-METER_W / 2, 0, 0.001); fill.scale.x = 0.0001;
+  track.renderOrder = 998; fill.renderOrder = 999; meter.add(track); meter.add(fill);
+  const label = makeCard(METER_W, 0.04, 384); label.draw(['Kitten Happiness'], false); label.mesh.visible = true; label.mesh.position.set(0, METER_H * 0.5 + 0.024, 0); meter.add(label.mesh);
+  let meterShown = -1;
+  // score card (Laser Tag): the same look as the end card, redrawn only when its lines change
+  const scoreCard = makeCard(END_W, END_H * 0.8, 768); group.add(scoreCard.mesh);
+  let scoreLines = '';
 
   function billboardFor(id, size) {
     let b = cats.get(id);
@@ -108,16 +236,46 @@ export function createRoomHook(opts = {}) {
     const st = result && result.state;
     if (!st || disposed) return;
     const tNow = now();
-    // box: drops, then sits on its spot; the lid goes when open; the box leaves after the climb (st.box.gone)
+    const fx = result.fx, dir = result.director, t = bridge.time;
+    uploadsThisFrame = 0;
+    // box: drops with a squash, jiggles while it waits, the flaps swing open on their hinges, the box leaves after the climb
     box.visible = !st.box.gone;
-    if (box.visible) {
-      box.position.set(st.box.x, st.box.y + BOX_SIZE_M * 1.07 / 2, st.box.z);
-      lid.visible = !st.box.open;
+    if (boxFile && !boxFreed) {
+      if (st.box.gone) { boxFreed = true; freeTexture(boxFile); boxArt = null; } // the box's 1 MB leaves with it (budget rule)
+      else { const bt = atlasTexture(boxFile, t); if (bt && bt !== boxArt) { boxArt = bt; for (const m of [boxMat, boxInner.material]) { m.map = bt; m.color.setHex(0xffffff); m.needsUpdate = true; } } }
     }
-    // laser dot (the sim's dot is already snapped to the nearest legal point)
-    if (st.laser) { laser.visible = true; laser.position.set(st.laser.x, st.laser.y + 0.003, st.laser.z); } else laser.visible = false;
-    // cats
-    const seen = new Set();
+    if (box.visible) {
+      boxAnim(st.box, fx ? fx.box : { landedAt: null, openedAt: null }, t, boxOut);
+      box.position.set(st.box.x, st.box.y, st.box.z);
+      box.rotation.y = boxOut.jiggle;
+      box.scale.set(1 + boxOut.squash, 1 - boxOut.squash * 0.8, 1 + boxOut.squash);
+      for (const f of flaps) f.pivot.rotation.x = f.sgn * boxOut.lid * 2.1; // ~120 deg open, outward
+      boxInner.visible = boxOut.lid > 0.05;
+    }
+    // the dot: Laser Tag's (director) or the Play laser (the sim's dot is already snapped to the nearest legal point)
+    const dot = dir && dir.dot ? dir.dot : st.laser;
+    // the Play laser has no alpha of its own: ramp it over 150 ms here (NIT 3: no one-frame pop); the Laser Tag dot brings GE1's alpha
+    const want = dot ? (Number.isFinite(dot.alpha) ? dot.alpha : 1) : 0, step = Math.min(1, Math.max(0, tNow - lastSyncMs) / 150);
+    lastSyncMs = tNow;
+    if (dot && Number.isFinite(dot.alpha)) playDotAlpha = want; else playDotAlpha += Math.max(-step, Math.min(step, want - playDotAlpha));
+    const dotAlpha = playDotAlpha;
+    if (dot) laser.position.set(dot.x, dot.y + 0.003, dot.z); // a fading-out dot keeps its last spot
+    if (dotAlpha > 0.001) { // drawn through opacity, never a visible toggle
+      laser.visible = true;
+      dotHalo.material.opacity = 0.35 * dotAlpha; dotRing.material.opacity = 0.95 * dotAlpha; dotCore.material.opacity = 0.95 * dotAlpha;
+      if (head) { const dx = head.x - laser.position.x, dy = head.y - laser.position.y, dz = head.z - laser.position.z; laser.scale.setScalar(Math.max(1, Math.sqrt(dx * dx + dy * dy + dz * dz) / 1.5)); } // >= 0.6 deg at any distance
+    } else laser.visible = false;
+    // the floor ring target (director.offerRing) while Laser Tag is offered or the score card is up
+    const ring = dir && dir.ring;
+    if (ring) { targetRing.visible = true; targetRing.position.set(ring.x, ring.y + 0.004, ring.z); }
+    else targetRing.visible = false;
+    // cats (+ fx.js squash & stretch); LOD ranks by distance to the head, refreshed twice a second
+    const seen = seenScratch; seen.clear();
+    const juice = fx ? fx.juice.cats : null;
+    if (atlas && head && tNow - lodT > 500) {
+      const order = result.cats.slice().sort((p, q) => ((head.x - p.x) ** 2 + (head.z - p.z) ** 2) - ((head.x - q.x) ** 2 + (head.z - q.z) ** 2));
+      order.forEach((c, i) => { const a = anim.get(c.id); if (a) a.rank = i; });
+    }
     for (const c of result.cats) {
       seen.add(c.id);
       const b = billboardFor(c.id, c.size); // size = kitten / adult sprite keys (Code Review B NIT 3)
@@ -126,10 +284,52 @@ export function createRoomHook(opts = {}) {
       b.root.rotation.set(0, c.yaw, 0);
       b.setView(c);
       b.setPose(c.pose);
-      b.update(tNow); // W3: per-sprite texture + crossfade
+      const j = juice && juice[c.id]; if (j) b.setSquash(j.sx, j.sy);
+      // P0a: the atlas frame for (view, pose, time since this anim started, walk speed), hi / lo by distance rank
+      const pose = artPose(c.pose), aid = artIdOf(c.id);
+      let f = null;
+      if (atlas && pose && atlas.resolveCat(aid)) {
+        let a = anim.get(c.id);
+        if (!a) { a = { key: '', since: tNow, x: c.x, z: c.z, t: tNow, speed: 0, lod: 'hi' }; anim.set(c.id, a); }
+        const dt = (tNow - a.t) / 1000; if (dt > 0.001) { const dx = c.x - a.x, dz = c.z - a.z; a.speed += (Math.sqrt(dx * dx + dz * dz) / dt - a.speed) * 0.3; a.x = c.x; a.z = c.z; a.t = tNow; }
+        const key = c.sprite + '|' + pose; if (key !== a.key) { a.key = key; a.since = tNow; }
+        // LOD by distance only (Design 11:2x): hi within 2.5 m, lo beyond
+        if (head && tNow - lodT > 500) { a.lod = pickLod(Math.sqrt((head.x - c.x) ** 2 + (head.z - c.z) ** 2), result.cats.length); }
+        // cat-views decides the sprite sheet (side / front / back / above / below) + the mirror (flipX = the heading points to the
+        // camera's left) + rotDeg for the top view; the atlas only supplies the frame (side art faces right, top art head +x)
+        f = atlas.getFrame(aid, c.sprite, pose, (tNow - a.since) / 1000, { lod: a.lod, speedMps: a.speed, flipX: !!c.flipX });
+      }
+      let ftex = f ? atlasTexture(f.file, t) : null;
+      if (f && !ftex) { // this sheet is not drawable yet (still decoding / no GPU room): the other lod, else the canvas sprite
+        const g = atlas.getFrame(aid, c.sprite, pose, (tNow - anim.get(c.id).since) / 1000, { lod: f.lod === 'hi' ? 'lo' : 'hi', speedMps: anim.get(c.id).speed, flipX: !!c.flipX });
+        const gt = g ? atlasTexture(g.file, t) : null; if (gt) { f = g; ftex = gt; }
+      }
+      if (f && ftex) b.setAtlasFrame(f, ftex); else b.setAtlasFrame(null);
+      b.update(tNow); // W3: per-sprite texture + crossfade (canvas sprites only)
       if (c.shadow) b.setShadow(c.shadow.y, c.shadow.alpha); else b.setShadow(null, 0);
     }
-    for (const [id, b] of cats) if (!seen.has(id)) b.root.visible = false; // still in the box
+    for (const [id, b] of cats) if (!seen.has(id)) b.root.visible = false; // still in the box / not this mode's cats
+    if (atlas && head && tNow - lodT > 500) lodT = tNow;
+    if (atlas) evictStale(t); // sheets not drawn for ~1 s leave the GPU (the image stays decoded in RAM: re-upload only)
+    // particles: pool -> instance matrices (a quad facing the head, scaled by the particle's size x scale)
+    if (fx) {
+      for (const kind of ['heart', 'dust', 'spark']) {
+        const ps = kind === 'heart' ? fx.hearts : kind === 'dust' ? fx.dust : fx.sparks, im = pools[kind];
+        for (let i = 0; i < ps.items.length; i++) {
+          const p = ps.items[i];
+          if (!p.alive || p.scale <= 0) { dummy.position.set(0, -10, 0); dummy.scale.set(0, 0, 0); }
+          else { dummy.position.set(p.x, p.y, p.z); const sz = p.size * p.scale; dummy.scale.set(sz, sz, sz); if (head) dummy.rotation.set(0, Math.atan2(head.x - p.x, head.z - p.z), 0); }
+          dummy.updateMatrix(); im.setMatrixAt(i, dummy.matrix);
+        }
+        im.instanceMatrix.needsUpdate = true;
+      }
+    }
+    // Kitten Happiness meter (Play beats only; hidden during Laser Tag and the score card)
+    if (dir && head && (dir.mode === 'play' || dir.mode === 'offer' || dir.mode === 'celebrate')) {
+      meter.visible = true;
+      placeCard(meter, head, gaze, CARD_AHEAD, CARD_BELOW - METER_ABOVE);
+      if (dir.meter !== meterShown) { meterShown = dir.meter; fill.scale.x = Math.max(0.0001, dir.meter); fill.material.color.setHex(dir.meterFull ? 0xffe08a : 0xff9ec7); }
+    } else meter.visible = false;
     // W3: wand + basket (wand.js view)
     const w = result.wand;
     if (w) {
@@ -144,13 +344,20 @@ export function createRoomHook(opts = {}) {
       feather.scale.setScalar(1 + 0.6 * (w.excitement || 0)); // a wiggled feather fluffs up
       if (head) feather.rotation.set(0, Math.atan2(head.x - w.tip.x, head.z - w.tip.z), 0);
     } else { basket.visible = false; stick.visible = false; feather.visible = false; }
+    // P0a: the Laser Tag score card (head-locked, centred) while the director shows one
+    const sc = dir && dir.scorecard;
+    if (sc) {
+      const key = sc.join('\n');
+      if (key !== scoreLines) { scoreLines = key; scoreCard.draw(sc, true); scoreCard.mesh.visible = true; }
+      placeCard(scoreCard.mesh, head, gaze, CARD_AHEAD, 0.02);
+    } else if (scoreCard.mesh.visible) { scoreCard.mesh.visible = false; scoreLines = ''; }
     // W3: hint / caption card (head-locked, under the gaze); the end card replaces it
     if (result.endCard) {
       if (cardLines !== 'end') { cardLines = 'end'; endCard.draw(result.endCard.lines, true); endCard.mesh.visible = true; card.mesh.visible = false; }
       placeCard(endCard.mesh, head, gaze, CARD_AHEAD, 0.05);
     } else {
       const lines = [];
-      if (result.hint) lines.push(result.hint.text);
+      if (result.hint) for (const l of String(result.hint.text).split('\n')) lines.push(l); // a two-line hint = two card lines at full size
       if (result.caption) lines.push(result.caption);
       const key = lines.join('\n');
       if (key !== cardLines) { cardLines = key; card.draw(lines, false); card.mesh.visible = lines.length > 0; }
@@ -172,13 +379,16 @@ export function createRoomHook(opts = {}) {
     for (const [, b] of cats) { b.root.traverse((o) => freeObject(o, true)); group.remove(b.root); } // maps belong to the cache
     cats.clear();
     cache.dispose();
-    lid.parent && box.remove(lid); freeObject(lid);
-    group.remove(box); freeObject(box);
-    group.remove(laser); freeObject(laser);
-    for (const o of [basket, stick, feather, card.mesh, endCard.mesh]) { group.remove(o); freeObject(o); }
+    for (const t of atlasTex.values()) t.dispose(); atlasTex.clear(); images.clear(); anim.clear();
+    box.traverse((o) => freeObject(o)); group.remove(box);
+    laser.traverse((o) => freeObject(o)); group.remove(laser);
+    group.remove(targetRing); freeObject(targetRing);
+    for (const kind in pools) { group.remove(pools[kind]); freeObject(pools[kind]); if (typeof pools[kind].dispose === 'function') pools[kind].dispose(); }
+    meter.traverse((o) => freeObject(o)); group.remove(meter);
+    for (const o of [basket, stick, feather, card.mesh, endCard.mesh, scoreCard.mesh]) { group.remove(o); freeObject(o); }
     if (group.parent) group.parent.remove(group);
     bridge.dispose();
   }
 
-  return { bridge, group, sync, cats, dispose, get disposed() { return disposed; } };
+  return { bridge, group, sync, cats, dispose, get disposed() { return disposed; }, get residency() { return { bytes: residency.bytes, files: residency.files, images: images.size, uploads }; } };
 }

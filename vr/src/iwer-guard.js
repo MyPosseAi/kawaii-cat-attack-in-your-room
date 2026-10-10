@@ -83,7 +83,9 @@ export function iwerGuardPlugin({ log = console.log } = {}) {
     name: 'kca-iwer-guard',
     apply: 'build',
     configResolved(config) { outDir = join(config.root, config.build.outDir); },
-    closeBundle() {
+    closeBundle(error) {
+      // Vite calls closeBundle from a `finally` even when the build failed; Rollup passes that error. Never replace it with ours.
+      if (error) { log('kca-iwer-guard: skipped, the build failed earlier (see the error above).'); return; }
       const r = checkDist(outDir);
       if (!r.ok) throw new Error(`kca-iwer-guard: ${r.problems.join('; ')}`);
       log(`kca-iwer-guard: ${r.scanned} files scanned, no IWER emulator runtime code.`);

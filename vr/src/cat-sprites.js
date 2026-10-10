@@ -47,6 +47,7 @@ export const POSE_MAP = Object.freeze({
   beg: ['sit', 'stand'],
   stare: ['stand', 'sit'],
   crouch: ['loaf', 'sit', 'stand'],
+  pin: ['loaf', 'sit', 'stand'], // / roomcat v2: holding the caught laser dot (grounded)
   run: ['run', 'trot', 'walk'],
   walk: ['walk', 'trot', 'run'],
   petted: ['loaf', 'sit'],

@@ -76,9 +76,19 @@ export function feedbackPlugin({ configUrl = FEEDBACK_CONFIG_URL, warn = console
       command = config.command;
       frozen = freeze ?? isContestFreeze({ mode: config.mode, outDir: config.build?.outDir });
     },
-    transformIndexHtml(html) {
-      if (frozen) return freezeIndexHtml(html);
-      return injectFeedback(html, loadFeedbackUrl(configUrl), { strict: command !== 'serve', warn });
+    // order 'pre' (Ops fix 2026-10-10, CI 'VR build' #8): Vite's own html plugin REMOVES every <script type="module" src>
+    // tag from index.html (they become bundle entries) before a plain / 'post' transformIndexHtml hook ever sees the page.
+    // The frozen cut of the src/dev-update.js tag (FREEZE_CUTS) must therefore run BEFORE that step: (1) so the cut finds
+    // its tag (found 0 -> freezeIndexHtml throws inside generateBundle; Vite then still runs closeBundle in its `finally`
+    // and the guards' "empty output" errors masked the real one), and (2) so dev-update.js is NOT bundled into the frozen
+    // entry at all (the frozen scan bans its strings). The dev-build injection (link + QR = <a> + inline SVG, no src URLs)
+    // is unaffected by running early; src/build-stamp.js stays 'post' (it fills {{PLAY_URL}} on the final page).
+    transformIndexHtml: {
+      order: 'pre',
+      handler(html) {
+        if (frozen) return freezeIndexHtml(html);
+        return injectFeedback(html, loadFeedbackUrl(configUrl), { strict: command !== 'serve', warn });
+      },
     },
   };
 }

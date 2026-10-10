@@ -32,7 +32,7 @@
    Build rule: only `export function` / `export const`; private names carry the `wd` prefix. */
 import { roomNearestLegal, roomSurface } from '../../game/core/room.js';
 
-export const WAND_VERSION = 6;
+export const WAND_VERSION = 7; // 7: `speed` (m/s) on every held wand event (big leap)
 export const WAND_TUNING = Object.freeze({
   basketRightM: 0.5, basketAheadM: 0.25, basketReachY: 0.45, // where the basket wants to be (then snapped to a legal surface)
   basketR: 0.12, basketH: 0.12,                              // basket size (host draws it; the wand handle rests at its rim)
@@ -261,12 +261,13 @@ export function wandStep(prev, ev, ctx, tuning) {
     st.handle = { x: ev.p.x, y: ev.p.y, z: ev.p.z };
     consumed = true;
     wdFollow(st, ctx, T, t, true);
-    events.push({ type: 'wand', on: true, hand, p: { ...st.tip } });
+    events.push({ type: 'wand', on: true, hand, p: { ...st.tip }, speed: 0 });
   } else if ((ev.type === 'move' || ev.type === 'pinch_hold') && st.held === hand && wdOk(ev.p)) {
     if (ev.type === 'move') {
       st.handle = { x: ev.p.x, y: ev.p.y, z: ev.p.z };
       wdFollow(st, ctx, T, t, false);
-      events.push({ type: 'wand', on: true, hand, p: { ...st.tip } });
+      // (GE3's ask): the tip speed in m/s rides on every held event; roomcat's big leap needs speed > bigLeapV
+      events.push({ type: 'wand', on: true, hand, p: { ...st.tip }, speed: wdLen(st.tipV.x, st.tipV.y, st.tipV.z) });
     }
   } else if ((ev.type === 'pinch_release' || ev.type === 'lost') && st.held === hand) {
     consumed = ev.type === 'pinch_release';

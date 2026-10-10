@@ -13,19 +13,23 @@
    - captionStep(prev, state, t) turns sound cues the sim produces (purr, climb-out mews, pounces, feather swats) into
      "(purring)"-style captions with a minimum show time and no repeat spam.
    Wording rules: original text, no brands, no "buy", no profanity (legal section 12 item 5 / 6). English only. */
-export const HINTS_VERSION = 1;
+export const HINTS_VERSION = 2; // 2: P0a slice pacing (HINTS_SLICE, HINT_TUNING_SLICE) + roomcat v2 event counters
 export const HINT_TUNING = Object.freeze({ showS: 20, restS: 40, maxShows: 3, moodS: 8, captionMinS: 1.5, captionGapS: 3 });
+/** P0a slice: 3 minutes, so hints show shorter and come back sooner. */
+export const HINT_TUNING_SLICE = Object.freeze({ showS: 12, restS: 18, maxShows: 3, moodS: 8, captionMinS: 1.2, captionGapS: 2.5 });
 
 /** Fresh progress counters. */
 export function createProgress() {
-  return { boxOpen: false, catsOut: 0, pets: 0, carries: 0, lasers: 0, wands: 0, treats: 0, tosses: 0, poofs: 0, naps: 0, hugs: 0 };
+  return { boxOpen: false, catsOut: 0, pets: 0, carries: 0, lasers: 0, wands: 0, treats: 0, tosses: 0, poofs: 0, naps: 0, hugs: 0,
+    catches: 0, nearMisses: 0, combos: 0, bigLeaps: 0, handClimbs: 0, eats: 0, tells: 0 }; // (roomcat v2 events)
 }
 
 /**
  * Count the player's deeds. events = the roomcat events the bridge sent this frame ({ type: 'pet' | 'pinch' | 'laser' |
- * 'wand' | 'treat' | 'release' ... }); state = roomcat state after the steps. Pure (returns a new object).
+ * 'wand' | 'treat' | 'release' ... }); state = roomcat state after the steps; simEvents (optional) = roomcat v2's
+ * `session.events` collected this frame (tell / pounce / near_miss / combo / big_leap / hand_climb). Pure (returns a new object).
  */
-export function progressStep(prev, events, state) {
+export function progressStep(prev, events, state, simEvents) {
   const c = Object.assign({}, prev || createProgress());
   for (const ev of events || []) {
     if (ev.type === 'pet') c.pets++;
@@ -34,15 +38,24 @@ export function progressStep(prev, events, state) {
     else if (ev.type === 'treat' && ev.on !== false) c.treats++;
     else if (ev.type === 'release') c.tosses++;
   }
+  for (const ev of simEvents || []) {
+    if (ev.type === 'pounce') { if (ev.catch) c.catches++; }
+    else if (ev.type === 'near_miss') c.nearMisses++;
+    else if (ev.type === 'combo') c.combos++;
+    else if (ev.type === 'big_leap') c.bigLeaps++;
+    else if (ev.type === 'hand_climb') c.handClimbs++;
+    else if (ev.type === 'tell') c.tells++;
+  }
   if (state) {
     if (state.box && state.box.open) c.boxOpen = true;
-    let out = 0, carried = 0, poof = 0, nap = 0, onhand = 0;
+    let out = 0, carried = 0, poof = 0, nap = 0, onhand = 0, eat = 0;
     for (const k of state.cats || []) {
       if (k.mode !== 'inbox') out++;
       if (k.mode === 'carried') carried++;
       if (k.poof) poof++;
       if (k.mode === 'nap') nap++;
       if (k.mode === 'onhand') onhand++;
+      if (k.pose === 'eat') eat++;
     }
     if (out > c.catsOut) c.catsOut = out;
     if (carried && !(prev && prev._carried)) c.carries++;
@@ -52,6 +65,8 @@ export function progressStep(prev, events, state) {
     if (onhand && !(prev && prev._onhand)) c.hugs++;
     c._onhand = onhand > 0;
     if (nap > c.naps) c.naps = nap;
+    if (eat && !(prev && prev._eat)) c.eats++;
+    c._eat = eat > 0;
   }
   return c;
 }
@@ -64,12 +79,31 @@ export const HINTS = Object.freeze([
     ready: (c) => c.catsOut > 0 && c.t >= c.firstOutT + 6, done: (c) => c.pets > 0 },
   { id: 'carry', text: 'Pinch the scruff of her neck to pick her up', anchor: 'cat', from: 0, until: 150,
     ready: (c) => c.pets > 0 || (c.catsOut > 0 && c.t >= 90), done: (c) => c.carries > 0 },
-  { id: 'laser', text: 'Point your finger: the kittens chase the red dot', anchor: 'hand', from: 0, until: 300,
+  { id: 'laser', text: 'Point your finger: the kittens chase the dot', anchor: 'hand', from: 0, until: 300,
     ready: (c) => c.carries > 0 || (c.catsOut > 0 && c.t >= 150), done: (c) => c.lasers > 0 },
   { id: 'wand', text: 'Pinch the feather wand from the basket, then wiggle it', anchor: 'basket', from: 0, until: 450,
     ready: (c) => c.catsOut > 0 && (c.t >= 300 || (c.lasers > 0 && c.t >= 240)), done: (c) => c.wands > 0 },
   { id: 'treat', text: 'Hold your palm up, flat and still, for a treat', anchor: 'hand', from: 0, until: 450,
     ready: (c) => c.catsOut > 0 && (c.wands > 0 || c.t >= 390), done: (c) => c.treats > 0 },
+  { id: 'sleepy', text: 'The kittens are getting sleepy', anchor: 'head', from: 0, until: Infinity, mood: true,
+    ready: (c) => c.phase === 'wind', done: (c) => c.phase === 'nap' || c.phase === 'end' },
+  { id: 'nap', text: 'Shh. Nap time.', anchor: 'head', from: 0, until: Infinity, mood: true,
+    ready: (c) => c.phase === 'nap', done: (c) => c.phase === 'end' },
+]);
+
+/** P0a slice beats (docs/P0A-SLICE.md GE2; order per GDXE Build 1 item 2: pet -> treat -> carry -> laser): the same deeds in 3 minutes, paced from the first kitten out (no wand: the
+ *  Happiness meter + the director's captions carry the rest). Original text, no brands, no "buy". */
+export const HINTS_SLICE = Object.freeze([
+  { id: 'box', text: 'Pinch the box flaps to open it', anchor: 'box', from: 0, until: Infinity,
+    ready: (c) => !!(c.box && c.box.landed) && !c.boxOpen, done: (c) => c.boxOpen },
+  { id: 'pet', text: 'Stroke her back slowly', anchor: 'cat', from: 0, until: Infinity,
+    ready: (c) => c.catsOut > 0 && c.t >= c.firstOutT + 4, done: (c) => c.pets > 0 },
+  { id: 'treat', text: 'Hold your palm up, flat and still, for a treat', anchor: 'hand', from: 0, until: Infinity,
+    ready: (c) => c.catsOut > 0 && (c.pets > 0 || c.t >= c.firstOutT + 20), done: (c) => c.handClimbs > 0 || c.hugs > 0 || c.eats > 0 },
+  { id: 'carry', text: 'Pinch her scruff, lift her, toss her gently', anchor: 'cat', from: 0, until: Infinity,
+    ready: (c) => c.catsOut > 0 && (c.hugs > 0 || c.eats > 0 || c.t >= c.firstOutT + 40), done: (c) => c.carries > 0 },
+  { id: 'laser', text: 'Point your finger: she chases the dot', anchor: 'hand', from: 0, until: Infinity,
+    ready: (c) => c.catsOut > 0 && (c.carries > 0 || c.t >= c.firstOutT + 55), done: (c) => c.catches > 0 || c.lasers > 90 },
   { id: 'sleepy', text: 'The kittens are getting sleepy', anchor: 'head', from: 0, until: Infinity, mood: true,
     ready: (c) => c.phase === 'wind', done: (c) => c.phase === 'nap' || c.phase === 'end' },
   { id: 'nap', text: 'Shh. Nap time.', anchor: 'head', from: 0, until: Infinity, mood: true,
@@ -83,12 +117,12 @@ export function createHintState() { return { current: null, since: null, shown: 
  * One frame. c = { t (session seconds), phase, box: { landed, open }, ...progress counters }. Returns { state, hint, changed }:
  * hint = { id, text, anchor } or null; changed = true on show / hide / swap (the host redraws the card only then).
  */
-export function hintStep(prev, c, tuning) {
-  const T = tuning || HINT_TUNING;
+export function hintStep(prev, c, tuning, list) {
+  const T = tuning || HINT_TUNING, L = list || HINTS;
   const st = Object.assign({}, prev || createHintState(), { shown: Object.assign({}, (prev || {}).shown || {}) });
   if (st.firstOutT == null && c.catsOut > 0) st.firstOutT = c.t;
   const cc = Object.assign({}, c, { firstOutT: st.firstOutT == null ? Infinity : st.firstOutT });
-  const byId = (id) => HINTS.find((h) => h.id === id);
+  const byId = (id) => L.find((h) => h.id === id);
   const before = st.current;
   if (st.current) {
     const h = byId(st.current), rec = st.shown[st.current];
@@ -99,7 +133,7 @@ export function hintStep(prev, c, tuning) {
     }
   }
   if (!st.current) {
-    for (const h of HINTS) {
+    for (const h of L) {
       if (cc.t < h.from || cc.t >= h.until) continue;
       if (h.done(cc) || !h.ready(cc)) continue;
       const rec = st.shown[h.id] || { count: 0, lastEnd: -Infinity };
@@ -120,7 +154,7 @@ export function soundCues(state, prevState) {
   if (!state) return cues;
   const prevBy = {};
   for (const k of (prevState && prevState.cats) || []) prevBy[k.id] = k;
-  let purr = 0, mew = 0, pounce = 0, bat = 0, poof = 0;
+  let purr = 0, mew = 0, pounce = 0, bat = 0, poof = 0, eat = 0, thump = 0;
   for (const k of state.cats || []) {
     const p = prevBy[k.id];
     if (k.purr) purr++;
@@ -128,12 +162,17 @@ export function soundCues(state, prevState) {
     if (k.pose === 'pounce' && (!p || p.pose !== 'pounce')) pounce++;
     if (k.pose === 'bat' && (!p || p.pose !== 'bat')) bat++;
     if (k.poof && !(p && p.poof)) poof++;
+    if (k.pose === 'eat' && (!p || p.pose !== 'eat')) eat++;
+    if (p && p.airborne && !k.airborne && (p.mode === 'fly' || p.pose === 'twist') && k.support !== 'hand') thump++;
   }
   if (purr) cues.push(purr > 1 ? '(purring)' : '(purr)');
   if (mew) cues.push('(mew!)');
   if (pounce) cues.push('(pounce)');
   if (bat) cues.push('(swat)');
   if (poof) cues.push('(poof)');
+  if (eat) cues.push('(nom nom)');
+  if (thump) cues.push('(thump)');
+  if (state.box && state.box.landed && !(prevState && prevState.box && prevState.box.landed)) cues.push('(thump)');
   return cues;
 }
 

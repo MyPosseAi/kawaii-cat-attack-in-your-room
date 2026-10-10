@@ -14,7 +14,12 @@
    Frozen = `vite build --mode contest-freeze` (= `npm run build:freeze`, writes dist-freeze/), env KCA_CONTEST_FREEZE=1, or an
    outDir named dist-freeze (a hand-run `vite build --outDir dist-freeze` can never produce an unfrozen "frozen" folder).
    The regular `npm run build` is unchanged: it keeps the link + QR and still fails on a placeholder issuesUrl.
-   Gaming Engineer 2, 2026-10-09. */
+   Gaming Engineer 2, 2026-10-09.
+   ALL HANDS P0a (Gaming Engineer 4, 2026-10-10; Legal item 2 / 13.11 row 2): the dev-only auto-update (src/dev-update.js
+   polling version.json, the "New build ready" toast, the #build-stamp corner line from src/build-stamp.js, and the dev
+   start-card sentence "This test build checks once a minute ...") is removed from the frozen entry the same way: four more
+   FREEZE_CUTS (sentence, stamp element, dev-update script tag, dev CSS), five more FORBIDDEN_MARKERS, and checkFreezeDist also
+   fails on a version.json file or an unfilled {{PLACEHOLDER}} in the output. The frozen entry stays zero-network. */
 import { existsSync, readFileSync, writeFileSync, renameSync, readdirSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, basename } from 'node:path';
@@ -70,8 +75,20 @@ export const FORBIDDEN_MARKERS = Object.freeze([
   'Work in progress',
   'updated until November 14',
   'kawaii-cat-attack-in-your-room/issues',
+  // Dev-only auto-update (item 2): the polled file, the poller, the stamp element id, the toast and the dev card sentence.
+  'version.json',
+  'dev-update',
+  'build-stamp',
+  'New build',
+  'This test build checks',
   // The contest bans (13.7) are NOT listed here: they are matched by salted hash (vr/freeze-bans.hashes.json, see above).
 ]);
+/** Legal item 2: the dev start-card sentence (after sentence 2) while the auto-update check ships; cut when frozen. */
+export const DEV_CHECK_SENTENCE = 'This test build checks once a minute for a newer version. That check sends no game data.';
+/** A dev-build file that must NOT exist in the frozen output (src/build-stamp.js writes it for dev builds only). */
+export const VERSION_FILE = 'version.json';
+/** Any {{NAME}} left on a page = a build placeholder nobody filled (src/build-stamp.js fills {{PLAY_URL}}). */
+export const PLACEHOLDER_LEFT_RE = /\{\{[A-Za-z_]+\}\}/;
 /** Scanned in the page files (*.html) only: the frozen page carries no absolute URL at all. Vendor chunks may legitimately
  *  carry github.com / https:// inside warning strings and XML namespaces, so these never run on assets/*.js (Review X2 S3);
  *  licenses.txt names upstream repos on github.com on purpose. */
@@ -95,6 +112,11 @@ export const FREEZE_CUTS = Object.freeze([
   { name: 'the privacy sentence about the feedback link', re: / Feedback only goes out if you tap Send feedback[^<]*?there is public\./g, count: 1, to: '' },
   { name: 'the #feedback-qr CSS rules', re: /[ \t]*#feedback-qr[^\n]*\n/g, count: 2, to: '' },
   { name: 'the #wip CSS rule -> #frozen, #hosting', re: /#wip \{/g, count: 1, to: '#frozen, #hosting {' },
+  // ALL HANDS P0a dev-only auto-update (item 2): the sentence, the stamp element, the poller script, the dev CSS.
+  { name: 'the D-111 dev start-card sentence "This test build checks ..."', re: / This test build checks once a minute for a newer version\. That check sends no game data\./g, count: 1, to: '' },
+  { name: 'the <p id="build-stamp"> element (src/build-stamp.js fills it in dev builds)', re: /[ \t]*<p id="build-stamp"[^\n]*\n/g, count: 1, to: '' },
+  { name: 'the src/dev-update.js <script> tag (version.json poll + toast)', re: /[ \t]*<script type="module" src="\/src\/dev-update\.js"><\/script>\r?\n/g, count: 1, to: '' },
+  { name: 'the #build-stamp / #dev-update-toast CSS rules', re: /[ \t]*#(?:build-stamp|dev-update-toast)[^\n]*\n/g, count: 3, to: '' },
 ]);
 
 /**
@@ -120,6 +142,11 @@ export function pageProblems(html) {
   const problems = left.map((m) => `still contains ${JSON.stringify(m)}`);
   for (const s of REQUIRED_PAGE_STRINGS) if (!html.includes(s)) problems.push(`missing the required frozen start-card text ${JSON.stringify(s.slice(0, 40) + '...')}`);
   return problems;
+}
+/** The {{PLACEHOLDER}} check is separate from pageProblems: freezeIndexHtml runs BEFORE src/build-stamp.js fills {{PLAY_URL}}. */
+export function placeholderProblems(html) {
+  const m = html.match(PLACEHOLDER_LEFT_RE);
+  return m ? [`unfilled build placeholder ${m[0]} (src/build-stamp.js did not run or the name is unknown)`] : [];
 }
 
 /** Drop the QR-encoder paragraph from a licenses.txt text (exactly one match, else throw). */
@@ -220,7 +247,9 @@ export function checkFreezeDist(dir, opts) {
   if (existsSync(index)) {
     const html = readFileSync(index, 'utf8');
     for (const s of REQUIRED_PAGE_STRINGS) if (!html.includes(s)) problems.push(`index.html: missing the required frozen start-card text "${s.slice(0, 40)}..." (Legal 13.6 item 5)`);
+    for (const p of placeholderProblems(html)) problems.push(`index.html: ${p}`);
   } else problems.push('index.html missing');
+  if (existsSync(join(dir, VERSION_FILE))) problems.push(`${VERSION_FILE}: present (the dev-only auto-update file; the frozen entry polls nothing, Legal D-111 item 2 / D-104)`);
   const lic = join(dir, LICENSES_FILE);
   if (existsSync(lic) && LICENSES_QR_CUT.test(readFileSync(lic, 'utf8'))) problems.push(`${LICENSES_FILE}: still carries the QR-encoder paragraph`);
   return { ok: problems.length === 0, problems, ...r };
@@ -233,12 +262,14 @@ export function freezeGuardPlugin({ log = console.log } = {}) {
     name: 'kca-freeze-guard',
     apply: (config, { command, mode }) => command === 'build' && isContestFreeze({ mode, outDir: config?.build?.outDir }),
     configResolved(config) { outDir = join(config.root, config.build.outDir); },
-    closeBundle() {
+    closeBundle(error) {
+      // Vite calls closeBundle from a `finally` even when the build failed; Rollup passes that error. Never replace it with ours.
+      if (error) { log('kca-freeze-guard: skipped, the build failed earlier (see the error above).'); return; }
       if (!existsSync(outDir)) throw new Error(`kca-freeze-guard: output folder ${outDir} was not written (the build failed earlier; see the error above)`);
       freezeLicensesFile(outDir);
       const r = checkFreezeDist(outDir);
       if (!r.ok) throw new Error(`kca-freeze-guard: ${r.problems.join('; ')}`);
-      log(`kca-freeze-guard: ${r.scanned} files scanned, frozen start card present, no feedback link / QR / Issues URL / WIP text (frozen entry).`);
+      log(`kca-freeze-guard: ${r.scanned} files scanned, frozen start card present, no feedback link / QR / Issues URL / WIP text / auto-update (frozen entry).`);
     },
   };
 }

@@ -3,6 +3,12 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+    <!-- Cache-busting: every script / asset Vite writes is name-hashed (assets/*-[hash].js), so only this page may be stale.
+         GitHub Pages cannot set response headers (it sends Cache-Control: max-age=600 on everything), so these two metas are
+         the best a static host allows: browsers mostly ignore them, and a reload re-validates the page anyway. The test
+         build's once-a-minute check + reload toast is what really gets a fresh build onto the headset (vr/README.md). -->
+    <meta http-equiv="Cache-Control" content="no-cache, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
     <title>Kawaii Cat Attack!! In Your Room</title>
     <style>
       html, body { margin: 0; height: 100%; background: #1d1626; color: #fff; font: 16px system-ui, sans-serif; }
@@ -18,12 +24,35 @@
       #caption { flex-basis: 100%; margin: 0; font-size: 14px; color: #c9f0ff; }
       #endcard { flex-basis: 100%; margin: 0; font-size: 15px; color: #ffd6ea; white-space: pre-line; }
       #log { flex: 1; min-width: 200px; font-size: 13px; opacity: .85; white-space: pre-line; }
+      #build-stamp { position: fixed; top: 8px; right: 10px; margin: 0; font: 12px ui-monospace, Menlo, Consolas, monospace; color: #c9f0ff; opacity: .8; background: rgba(29, 22, 38, .7); padding: 3px 8px; border-radius: 6px; }
+      #dev-update-toast { position: fixed; top: 38px; right: 10px; font: inherit; padding: 10px 14px; border: 0; border-radius: 10px; background: #ffe08a; color: #2a1030; cursor: pointer; opacity: 0; transition: opacity .3s ease; }
+      #dev-update-toast.show { opacity: 1; }
+      /* Flat preview card (no immersive-ar / immersive-vr here: a PC or a phone). The inline script below adds body.flat. */
+      #flat-card { display: none; position: fixed; left: 16px; right: 16px; top: 50%; transform: translateY(-60%); margin: 0 auto; max-width: 440px; padding: 28px 24px; border-radius: 20px; background: #2a1f3a; box-shadow: 0 12px 40px rgba(0, 0, 0, .45); text-align: center; }
+      #flat-card h1 { margin: 0 0 6px; font-size: 22px; }
+      #flat-card .cat { font-size: 44px; line-height: 1; margin-bottom: 10px; }
+      #flat-card p { margin: 8px 0; font-size: 15px; opacity: .92; }
+      #flat-card .addr { display: inline-block; margin: 6px 0 2px; padding: 8px 14px; border-radius: 999px; background: #1d1626; color: #ffc4e3; font: 15px ui-monospace, Menlo, Consolas, monospace; word-break: break-all; user-select: all; }
+      #flat-card .small { font-size: 13px; opacity: .7; }
+      #flat-card button { font: inherit; font-size: 13px; margin-top: 10px; padding: 6px 12px; border: 1px solid #ffc4e3; border-radius: 999px; background: transparent; color: #ffc4e3; cursor: pointer; }
+      body.flat #flat-card { display: block; }
+      body.flat #scene-container, body.flat #enter, body.flat #log, body.flat #hint, body.flat #caption, body.flat #endcard { display: none; }
     </style>
   </head>
   <body>
     <div id="scene-container"></div>
+    <p id="build-stamp" hidden></p>
+    <section id="flat-card" role="dialog" aria-labelledby="flat-title">
+      <div class="cat" aria-hidden="true">&#x1F431;</div>
+      <h1 id="flat-title">This is a headset game</h1>
+      <p>Open this page in the browser on your Quest 3 to play. Your real room becomes the kittens' room, and your hands are the toys.</p>
+      <p>Type or paste this address in the headset browser:</p>
+      <span class="addr">{{PLAY_URL}}</span>
+      <p class="small">On a PC or phone there is nothing to play here, only the start card below.</p>
+      <button id="flat-dismiss" type="button">Show the flat preview anyway</button>
+    </section>
     <div id="hud">
-      <p id="privacy">Your room and hand data stay on your headset. The game records nothing and sends nothing. Only the day of your last visit, how many visits you've made, and each kitten's hearts, the visit you met it on and its favourite kind of nap spot (like bed, couch or floor) are saved, in this headset's browser, so the kittens can remember you tomorrow. Feedback only goes out if you tap Send feedback, which opens a public GitHub page; anything you post there is public.</p>
+      <p id="privacy">Your room and hand data stay on your headset. The game records nothing and sends nothing. This test build checks once a minute for a newer version. That check sends no game data. Only the day of your last visit, how many visits you've made, and each kitten's hearts, the visit you met it on and its favourite kind of nap spot (like bed, couch or floor) are saved, in this headset's browser, so the kittens can remember you tomorrow. Feedback only goes out if you tap Send feedback, which opens a public GitHub page; anything you post there is public.</p>
       <p id="wip">Work in progress: updated until November 14, 2026.</p>
       <button id="enter" type="button">Enter your room</button>
       <a href="./licenses.txt" target="_blank" rel="noopener">Credits &amp; licences</a>
@@ -33,6 +62,22 @@
       <p id="endcard" hidden></p>
       <div id="log" aria-live="polite">Loading...</div>
     </div>
+    <script type="module">
+      // Flat preview card: shown only where no immersive session is possible (PC, phone). The Quest browser and the IWER
+      // emulator (dev server, CI smoke) answer yes to immersive-ar, so they never see it. Build-time text, no request.
+      const flatCheck = async () => {
+        let ok = false;
+        try {
+          const xr = navigator.xr;
+          if (xr) ok = (await xr.isSessionSupported('immersive-ar')) || (await xr.isSessionSupported('immersive-vr'));
+        } catch (e) { ok = false; }
+        document.body.classList.toggle('flat', !ok);
+      };
+      flatCheck();
+      setTimeout(flatCheck, 2000); // once more in case an emulator / polyfill installed navigator.xr late
+      document.getElementById('flat-dismiss').addEventListener('click', () => document.body.classList.remove('flat'));
+    </script>
     <script type="module" src="/src/main.js"></script>
+    <script type="module" src="/src/dev-update.js"></script>
   </body>
 </html>
