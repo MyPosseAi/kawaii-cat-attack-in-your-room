@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+    <title>Kawaii Cat Attack!! In Your Room</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #1d1626; color: #fff; font: 16px system-ui, sans-serif; }
+      #scene-container { position: fixed; inset: 0; }
+      #hud { position: fixed; left: 16px; right: 16px; bottom: 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+      #enter { font: inherit; padding: 12px 20px; border: 0; border-radius: 999px; background: #ff8fc7; color: #2a1030; cursor: pointer; }
+      #privacy { flex-basis: 100%; margin: 0; font-size: 14px; opacity: .9; }
+      #wip { flex-basis: 100%; margin: 0; font-size: 13px; color: #ffe08a; }
+      #hud a { color: #ffc4e3; font-size: 13px; }
+      #feedback-qr { flex-basis: 100%; margin: 0; display: flex; gap: 10px; align-items: center; font-size: 13px; color: #ffc4e3; }
+      #feedback-qr .qr { width: 96px; height: 96px; border-radius: 6px; }
+      #hint { flex-basis: 100%; margin: 0; font-size: 15px; color: #ffe08a; }
+      #caption { flex-basis: 100%; margin: 0; font-size: 14px; color: #c9f0ff; }
+      #endcard { flex-basis: 100%; margin: 0; font-size: 15px; color: #ffd6ea; white-space: pre-line; }
+      #log { flex: 1; min-width: 200px; font-size: 13px; opacity: .85; white-space: pre-line; }
+    </style>
+  </head>
+  <body>
+    <div id="scene-container"></div>
+    <div id="hud">
+      <p id="privacy">Your room and hand data stay on your headset. The game records nothing and sends nothing. Only the day of your last visit, how many visits you've made, and each kitten's hearts, the visit you met it on and its favourite kind of nap spot (like bed, couch or floor) are saved, in this headset's browser, so the kittens can remember you tomorrow. Feedback only goes out if you tap Send feedback, which opens a public GitHub page; anything you post there is public.</p>
+      <p id="wip">Work in progress: updated until November 14, 2026.</p>
+      <button id="enter" type="button">Enter your room</button>
+      <a href="./licenses.txt" target="_blank" rel="noopener">Credits &amp; licences</a>
+      <!-- feedback -->
+      <p id="hint" hidden></p>
+      <p id="caption" hidden aria-live="polite"></p>
+      <p id="endcard" hidden></p>
+      <div id="log" aria-live="polite">Loading...</div>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

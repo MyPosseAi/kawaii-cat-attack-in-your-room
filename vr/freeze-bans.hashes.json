@@ -1,0 +1,23 @@
+{
+  "_note": "Salted hashes of phrases the contest build must not contain: hashes only, never the phrases. Regenerate with a fresh salt if the list changes.",
+  "algo": "sha256",
+  "salt": "947e3d4bfae2cdfa4b70b63098105abd",
+  "scheme": "hex(sha256(utf8(salt + text))). text = NFKC, lowercase, letters-only tokens ([a-z]+). Every 1-token window, every 2-token window joined by ONE space and every 2-token window joined with NO space is hashed and compared; a match on any entry fails the frozen build (vr/src/freeze-guard.js).",
+  "entries": [
+    "ban_1_spaced",
+    "ban_1_joined",
+    "ban_2_spaced",
+    "ban_2_joined",
+    "ban_3_spaced",
+    "ban_3_joined"
+  ],
+  "hashes": [
+    "635a5768fce9c1cf3d9286ddb7b67dca4288be673952bd482d60e9799a6fbe4c",
+    "2db5cda3d7b9824215a2169255cf182f5f850e415673d59714db63115c883cb3",
+    "e2867831ffc46c0fab94a01a5ec699f02d0954d12c0046ba1f064aa104881a23",
+    "0a0e5f04bc860c0d4788a363090bfb44272ae46df321adc61c2e7d667fdd8b70",
+    "9c95e973d07d18d7fac335788e71cd78f103bdfff1996a7b1ca76432dc4e7c3e",
+    "194275fa3c56d721202f2a8bb4df768704139ad05037f68b84ec230425da3566"
+  ],
+  "made": "2026-10-09"
+}

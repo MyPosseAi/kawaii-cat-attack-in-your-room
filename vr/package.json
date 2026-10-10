@@ -1,0 +1,29 @@
+{
+  "name": "kca-vr",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Kawaii Cat Attack!! In Your Room - WebXR mixed-reality mode (IWSDK) for the Meta VR Start competition",
+  "type": "module",
+  "scripts": {
+    "dev": "iwsdk dev restart --open --foreground",
+    "dev:vite": "vite",
+    "dev:lan": "vite --host 0.0.0.0",
+    "dev:status": "iwsdk dev status",
+    "dev:down": "iwsdk dev down",
+    "build": "vite build",
+    "build:freeze": "vite build --mode contest-freeze --outDir dist-freeze",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@iwsdk/core": "1.0.1",
+    "three": "npm:super-three@0.181.0"
+  },
+  "devDependencies": {
+    "@iwsdk/cli": "1.0.1",
+    "@iwsdk/vite-plugin-dev": "1.0.1",
+    "vite": "7.3.7"
+  },
+  "engines": {
+    "node": ">=20.19.0 <21.0.0-0 || >=22.12.0 <23.0.0-0 || >=24.0.0"
+  }
+}

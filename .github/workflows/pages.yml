@@ -1,0 +1,63 @@
+# Build the WebXR game (vr/) and publish it to GitHub Pages.
+# No secrets are used. Permissions are read-only except what Pages deployment needs.
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install (exact versions from the committed lockfile)
+        working-directory: vr
+        run: |
+          test -f package-lock.json || { echo "::error::vr/package-lock.json missing"; exit 1; }
+          npm ci --no-audit --no-fund
+      - name: Build
+        working-directory: vr
+        run: npm run build
+      - name: Check build output
+        run: |
+          test -f vr/dist/index.html || { echo "::error::vr/dist/index.html missing"; exit 1; }
+          test -f vr/dist/licenses.txt || { echo "::error::vr/dist/licenses.txt missing"; exit 1; }
+          # The spatial-UI markup package pulled in by @iwsdk/core has no licence and is kept out of the build
+          # (vr/vite.config.js aliases it to vr/src/stubs/uikitml-stub.js). Fail the deploy if its code reaches dist/.
+          (cd vr && node src/uikitml-guard.js dist) || { echo "::error::unlicensed UI-markup package code in vr/dist/ (or the stub is missing). See vr/src/uikitml-guard.js."; exit 1; }
+          # The dev-only WebXR emulator (IWER) is injected by the IWSDK dev plugin during `vite dev` only
+          # (vr/iwsdk.config.json: injectOnBuild=false). Fail the deploy if its runtime reaches dist/.
+          (cd vr && node src/iwer-guard.js dist) || { echo "::error::IWER emulator runtime found in vr/dist/. injectOnBuild must stay false. See vr/src/iwer-guard.js."; exit 1; }
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: vr/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

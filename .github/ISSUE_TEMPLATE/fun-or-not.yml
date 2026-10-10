@@ -1,0 +1,57 @@
+name: "Fun or not?"
+description: "Quick rating: was it fun?"
+title: "[Fun?] "
+labels: [fun-or-not]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Your post is public.** Everything you write or attach here, and your GitHub username, is public on GitHub. GitHub's Privacy Statement covers your GitHub account. HeatSeeker LLC, which makes Kawaii Cat Attack!!, reads posts to fix bugs and improve the game. The game itself sends us nothing.
+
+        **Don't post personal info** (yours or anyone else's): no names, email, phone numbers, addresses, school, faces, or photos or videos of people, kids or your home. We may hide or edit out personal info, and remove posts that break these rules.
+
+        **13+ only.** You need a GitHub account, and GitHub requires users to be 13 or older. If we learn a post came from someone under 13, we delete it.
+
+        Want a post removed? Comment "please delete" on it.
+
+        By posting, you let HeatSeeker LLC use your feedback (ideas, bug reports, stories) freely, for any purpose, without paying you, and without naming you unless you agree below (a free, worldwide, permanent licence). Only post things that are yours to share.
+  - type: dropdown
+    id: fun
+    attributes:
+      label: Was it fun?
+      options: [Loved it, It was fun, It was OK, Not really]
+    validations:
+      required: true
+  - type: textarea
+    id: best
+    attributes:
+      label: Best part
+  - type: textarea
+    id: worst
+    attributes:
+      label: Most confusing or annoying part
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: Before you post
+      options:
+        - label: "I'm 13 or older."
+          required: true
+        - label: "I haven't included personal info about me or anyone else."
+          required: true
+  - type: checkboxes
+    id: quote
+    attributes:
+      label: Quoting (optional, 18+ only)
+      options:
+        - label: "You may quote this post word for word on Kawaii Cat Attack!!'s own pages and posts. I'm 18 or older."
+          required: false
+  - type: dropdown
+    id: credit
+    attributes:
+      label: "If quoted, credit me as:"
+      options:
+        - Anonymous
+        - My GitHub username
+    validations:
+      required: false

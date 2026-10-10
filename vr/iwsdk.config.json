@@ -1,0 +1,30 @@
+{
+  "$schema": "./node_modules/@iwsdk/core/dist/schemas/iwsdk-project.v1.schema.json",
+  "version": "iwsdk.project.v1",
+  "scene": "./public/scenes/hello-cat.iwsdk.scene.json",
+  "world": {
+    "xr": {
+      "mode": "ar",
+      "offer": "always",
+      "referenceSpace": "local-floor",
+      "features": {
+        "handTracking": { "required": false },
+        "planeDetection": { "required": false },
+        "meshDetection": { "required": false },
+        "hitTest": { "required": false },
+        "anchors": { "required": false }
+      }
+    },
+    "features": {
+      "sceneUnderstanding": { "showWireFrame": false }
+    }
+  },
+  "dev": {
+    "emulator": {
+      "device": "metaQuest3",
+      "environment": "living_room",
+      "activation": "localhost",
+      "injectOnBuild": false
+    }
+  }
+}
