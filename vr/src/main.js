@@ -78,7 +78,7 @@ function setLine(id, text) {
   const el = typeof document !== 'undefined' && document.getElementById(id);
   if (el) { el.textContent = text || ''; el.hidden = !text; }
 }
-function setHint(text) { setLine('hint', text); if (text) log(`hint: ${text}`); }
+function setHint(text) { setLine('hint', text); if (text) log(`hint: ${text}`); if (DEV && typeof window !== 'undefined' && window.__kcaPerfEvent) window.__kcaPerfEvent('hint', { text: text ? String(text).slice(0, 24) : null }); }
 function setCaption(text) { setLine('caption', text); }
 function setEndCard(card, memory) {
   const el = typeof document !== 'undefined' && document.getElementById('endcard');
@@ -98,7 +98,7 @@ class RoomCatSystem extends createSystem({
     // room sim glue (plain data in, three objects out), one hook per XR session. Room / hand details are DEV-only logs
     // (Legal section 10).
     this.life = createSessionLife({
-      makeHook: () => { const v = startVisit(); return createRoomHook({ seed: SESSION_SEED, cats: v.cats, roster: ROSTER, names: NAMES, visit: v.visit, persisted: v.persisted, memory: v.memory, renderer: this.world && this.world.renderer ? this.world.renderer : null, onLog: DEV ? (m) => log(m) : null }); },
+      makeHook: () => { const v = startVisit(); return createRoomHook({ seed: SESSION_SEED, cats: v.cats, roster: ROSTER, names: NAMES, visit: v.visit, persisted: v.persisted, memory: v.memory, renderer: this.world && this.world.renderer ? this.world.renderer : null, onLog: DEV ? (m) => log(m) : null, onPerf: DEV && this.perf ? (what, d) => this.perf.event(what, d) : null }); },
       attach: (hook) => {
         const entity = this.world.createTransformEntity(hook.group, { persistent: true });
         return () => { if (entity && typeof entity.destroy === 'function') entity.destroy(); };
@@ -119,6 +119,38 @@ class RoomCatSystem extends createSystem({
     // reads room / cat state through it. `import.meta.env.DEV` is false in `vite build`, so the whole branch is dropped from
     // dist/ (never shipped, never logged). Plain numbers only; nothing here leaves the page.
     if (DEV && typeof window !== 'undefined') {
+      // DEV-only perf split (CI #11 ask): WHERE a frame's work goes. `sim` = this system's update() (bridge: gestures + sim steps +
+      // director + fx + hook.sync), `render` = renderer.render (the GL submit; software GL on the CI runner makes it synchronous and
+      // slow), the rest of kca-frames' workMs = IWSDK's own systems. Plus renderer.info after each render (draw calls, triangles,
+      // programs, textures) and a ring of perf EVENTS (sheet uploads / frees, card redraws, warm steps, beat / hint changes) with
+      // their time, so a slow frame in kca-spikes can be named. Plain numbers; nothing leaves the page; dropped from dist/ with the hook.
+      const sys = this;
+      const perf = this.perf = { sim: [], render: [], t: [], first: null, events: [], renders: 0, info: null, lastRenderMs: 0, programsAtStart: null,
+        now: () => performance.now(),
+        event(what, d) { if (perf.events.length >= 400) perf.events.shift(); perf.events.push(Object.assign({ atS: perf.first == null ? null : +((perf.now() - perf.first) / 1000).toFixed(2), what }, d || {})); },
+        stats(a) { const s = a.slice().sort((x, y) => x - y), n = s.length; return { n, mean: n ? +(s.reduce((x, y) => x + y, 0) / n).toFixed(3) : 0, p95: n ? +s[Math.min(n - 1, Math.floor(0.95 * n))].toFixed(2) : 0, max: n ? +s[n - 1].toFixed(2) : 0 }; },
+        snapshot() {
+          const rows = perf.t.map((t, i) => ({ i, atS: +((t - perf.first) / 1000).toFixed(2), simMs: +perf.sim[i].toFixed(2), renderMs: +perf.render[i].toFixed(2) }));
+          const slowest = rows.slice().sort((a, b) => (b.simMs + b.renderMs) - (a.simMs + a.renderMs)).slice(0, 10)
+            .map((r) => Object.assign({}, r, { events: perf.events.filter((e) => e.atS != null && e.atS <= r.atS + 0.02 && e.atS >= r.atS - 0.3).map((e) => e.what + (e.file ? ':' + e.file : e.which ? ':' + e.which : e.step ? ':' + e.step : '') + (e.ms != null ? ' ' + e.ms + 'ms' : '')) }));
+          const h = sys.life.hook;
+          const xr = sys.world && sys.world.renderer ? sys.world.renderer.xr : null; // CB S3: multiview changes the program variant; the warm draw inside the session covers it
+          const multiview = xr ? (typeof xr.isMultiview === 'boolean' ? xr.isMultiview : typeof xr.multiview === 'boolean' ? xr.multiview : null) : null;
+          return { simMs: perf.stats(perf.sim), renderMs: perf.stats(perf.render), frames: perf.t.length, renders: perf.renders, info: perf.info, slowest, events: perf.events.slice(-120),
+            programsAtStart: perf.programsAtStart, programsNow: perf.info ? perf.info.programs : null, multiview,
+            residency: h && h.residency ? h.residency : null, prebuilt: h && h.bridge ? !!h.bridge.prebuilt : null };
+        },
+      };
+      const r = this.world && this.world.renderer;
+      if (r && typeof r.render === 'function') {
+        const orig = r.render.bind(r);
+        r.render = (scene, camera) => {
+          const t0 = perf.now(); orig(scene, camera); const ms = perf.now() - t0;
+          perf.lastRenderMs += ms; perf.renders++;
+          const inf = r.info; if (inf) { const programs = inf.programs ? inf.programs.length : null; if (perf.info && programs !== perf.info.programs) perf.event('programs', { from: perf.info.programs, to: programs });
+            perf.info = { calls: inf.render.calls, triangles: inf.render.triangles, programs, textures: inf.memory.textures, geometries: inf.memory.geometries }; }
+        };
+      }
       const bridge = () => (this.life.hook ? this.life.hook.bridge : null);
       const floorOf = (b) => { const f = b && b.room ? b.room.surfaces.find((s) => s.kind === 'floor') : null; return f ? { id: f.id, y: f.y, virtual: !!f.virtual } : null; };
       window.__kcaSmoke = {
@@ -137,7 +169,9 @@ class RoomCatSystem extends createSystem({
         meter: () => { const b = bridge(); return b && b.director ? b.director.meter.value : null; },
         sound: () => ({ enabled: sound.enabled, played: sound.played, dropped: sound.dropped }),
         cats: () => { const b = bridge(); return b && b.state ? b.state.cats.map(({ id, x, y, z, surf, mode, pose }) => ({ id, x, y, z, surf, mode, pose })) : []; },
+        perf: () => perf.snapshot(), // sim vs render split, renderer.info, slowest frames with their events
       };
+      window.__kcaPerfEvent = (what, d) => perf.event(what, d);
     }
 
     this.cleanupFuncs.push(
@@ -197,6 +231,13 @@ class RoomCatSystem extends createSystem({
     const frame = this.xrFrame;
     this.watchSession(frame ? frame.session : null);
     if (!frame || !this.life.hook) return;
+    if (!DEV || !this.perf) return this.updateXR(delta, frame);
+    // DEV perf split: this system's time per XR frame + the render time of the PREVIOUS render call (render runs after the systems)
+    const P = this.perf, t0 = P.now(); if (P.first == null) P.first = t0;
+    try { this.updateXR(delta, frame); } finally { P.sim.push(P.now() - t0); P.render.push(P.lastRenderMs); P.t.push(t0); P.lastRenderMs = 0; if (P.sim.length > 20000) { P.sim.shift(); P.render.shift(); P.t.shift(); } }
+  }
+
+  updateXR(delta, frame) {
     const ref = this.xrManager.getReferenceSpace();
     const head = this.camera.getWorldPosition(tmpA);
     const gaze = this.camera.getWorldDirection(tmpD);
@@ -216,6 +257,9 @@ class RoomCatSystem extends createSystem({
       const root = this.preview.root;
       root.position.y = floorY;
       root.rotation.set(0, Math.atan2(head.x - root.position.x, head.z - root.position.z), 0);
+      // perf: the scan window warms the room's shaders + first textures (one step per frame; room-hook warm()), so the first
+      // gameplay frame does not pay the compiles / uploads (CI #11 frames 8 / 9)
+      if (typeof this.life.hook.warm === 'function') this.life.hook.warm(this.world && this.world.renderer ? this.world.renderer : null, this.camera, this.world && this.world.scene ? this.world.scene : null);
     }
 
     // 1) scene snapshots until the room settles (or no scan -> virtual rug after 3 s), then
@@ -226,6 +270,7 @@ class RoomCatSystem extends createSystem({
       head: { x: head.x, y: head.y, z: head.z }, fwd: { x: fwd.x, z: fwd.z }, gaze: { x: gaze.x, y: gaze.y, z: gaze.z },
       floorY, postureFloorY, kinds: inputKinds(frame.session),
     });
+    if (DEV && this.perf && this.perf.programsAtStart == null && this.life.started) { this.perf.programsAtStart = this.perf.info ? this.perf.info.programs : -1; this.perf.event('started', { programs: this.perf.programsAtStart, prebuilt: !!this.life.hook.bridge.prebuilt }); }
     if (DEV && result) for (const ev of result.events) if (ev.type === 'pinch' || ev.type === 'release' || ev.type === 'treat' || ev.type === 'wand') log(`${ev.type}${ev.on === false ? ' off' : ''} ${ev.hand || ''}`);
     // P0a: this frame's cues -> sound (synth) + controller haptics (hands have none); DEV logs the beat changes only
     if (result && result.fx) {
@@ -234,6 +279,7 @@ class RoomCatSystem extends createSystem({
       hapticPulse(haptics, frame.session.inputSources, result.fx.haptic, typeof performance !== 'undefined' ? performance.now() : Date.now());
       if (result.director && result.director.mode !== this.lastMode) {
         this.lastMode = result.director.mode;
+        if (DEV && this.perf) this.perf.event('beat', { mode: this.lastMode });
         if (DEV) log(`beat: ${this.lastMode}${result.director.mode === 'scorecard' && result.director.scorecard ? ' (' + result.director.scorecard[1] + ')' : ''}`);
         // GE4's dev-only "New build ready" toast (Legal item 2) only between rounds: the Laser Tag score card is the one rest (review BB S6)
         setDevPlaying(this.lastMode !== 'scorecard');

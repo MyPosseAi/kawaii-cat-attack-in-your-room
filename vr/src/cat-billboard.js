@@ -137,6 +137,7 @@ function drawCat(ctx, s) {
 }
 
 const DEG2RAD = Math.PI / 180;
+export const HOLD_MAX_S = 0.25; // cat-billboard holdFrame: the longest a kitten keeps a stale atlas frame while the next sheet uploads
 
 /** Create one billboard. Returns { root, quad, shadow, setView, setPose, setShadow }:
  *  setView({ sprite, flipX, rotDeg, tiltDeg }) applies the cat-views.js transform (flip = scale.x, rotDeg clockwise ->
@@ -189,6 +190,7 @@ export function createCatBillboard(opts = {}) {
   let pose = 'sit';
   let jx = 1, jy = 1; // P0a juice (fx.js juiceStep): squash & stretch multipliers, applied about the paws
   let frame = null;   // P0a atlas mode (Design's VR1 sprites): the current atlas frame { sizeM, centerM, liftM, flipX, uv }
+  let holdSince = null; // perf: sim time the current frame started being HELD (its successor's sheet not resident yet), see holdFrame
   const apply = () => {
     const lean = pose === 'carried' ? 18 : pose === 'poof' ? -12 : pose === 'fall' ? 8 : 0;
     if (frame) {
@@ -233,6 +235,7 @@ export function createCatBillboard(opts = {}) {
      *  become the frame's rect (flip included), its size / offset the frame's metres; the crossfade quad is parked. null = back
      *  to the canvas sprites. Cheap when the same frame index repeats. */
     setAtlasFrame(f, tex) {
+      holdSince = null;
       if (!f) { if (frame) { frame = null; quad.material.opacity = 1; uvAttr.setXY(0, 0, 1); uvAttr.setXY(1, 1, 1); uvAttr.setXY(2, 0, 0); uvAttr.setXY(3, 1, 0); uvAttr.needsUpdate = true; fader = createFader(cache ? `${catId}:${catSize}:side:sit` : null, 0); apply(); } return; }
       const same = frame && frame.file === f.file && frame.index === f.index && frame.view === f.view && frame.anim === f.anim && frame.flipX === f.flipX && frame.lod === f.lod;
       frame = f;
@@ -244,6 +247,9 @@ export function createCatBillboard(opts = {}) {
       }
     },
     get atlasMode() { return !!frame; },
+    /** perf: keep showing the current atlas frame while its successor's sheet uploads (the host calls this instead of
+     *  setAtlasFrame(null)); true while the hold is <= HOLD_MAX_S of sim time, false = give up and fall back (tS in seconds) */
+    holdFrame(tS) { if (!frame) return false; if (holdSince == null) holdSince = tS; return tS - holdSince <= HOLD_MAX_S; },
     /** W3: call after setView / setPose each frame with the host clock in ms */
     update(nowMs) { setSprite(nowMs); },
     setShadow(y, alpha) {

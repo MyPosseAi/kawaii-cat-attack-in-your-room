@@ -30,7 +30,7 @@ import { ART_MANIFEST } from './art-manifest.gen.js';
 import { artIdOf, artPose, boxFaceUV, createResidency } from './art-glue.js';
 import { LT_ROOM_STARTERS } from '../../game/core/lasertag-room.js';
 import { HAPPY_TUNING } from './director.js';
-import { ImageLoader, LinearFilter, Texture } from 'three';
+import { DataTexture, ImageLoader, LinearFilter, RGBAFormat, Texture, UnsignedByteType } from 'three';
 
 const BOX_SIZE_M = 0.28; // roomcat: boxR 0.14, boxH 0.3
 const CARD_W = 0.42, CARD_H = 0.12, CARD_AHEAD = 0.9, CARD_BELOW = 0.22; // head-locked hint card (metres)
@@ -100,6 +100,8 @@ export function createRoomHook(opts = {}) {
   const images = new Map();   // file -> HTMLImageElement (decoded) | 'loading'
   const atlasTex = new Map(); // file -> Texture (GPU resident)
   const residency = createResidency(8 * 1024 * 1024, 1.0);
+  const onPerf = typeof opts.onPerf === 'function' ? opts.onPerf : null; // DEV smoke only: (what, detail) for every upload / free / card redraw / warm step
+  const pinned = new Set(); // sheets uploaded by warm() before their first draw: kept through the stale sweep until drawn once (the budget still counts them)
   const sheetBytes = (file) => (/\.lo\.png$/.test(file) ? M.lods.lo.gpuBytesPerCat : M.lods.hi.gpuBytesPerCat);
   const imgLoader = typeof document !== 'undefined' ? new ImageLoader() : null;
   function preloadImage(file) {
@@ -128,12 +130,16 @@ export function createRoomHook(opts = {}) {
     uploadsThisFrame++; uploads++;
     for (const f of evicted) freeTexture(f, true);
     t = new Texture(img); t.colorSpace = SRGBColorSpace; t.generateMipmaps = false; t.minFilter = LinearFilter; t.magFilter = LinearFilter; t.needsUpdate = true;
+    const t0 = onPerf ? now() : 0;
     if (opts.renderer && typeof opts.renderer.initTexture === 'function') { try { opts.renderer.initTexture(t); } catch (e) { /* upload at first draw */ } }
+    if (onPerf) onPerf('upload', { file, bytes: sheetBytes(file), ms: +(now() - t0).toFixed(2), evicted: evicted.length, resident: residency.bytes });
     atlasTex.set(file, t);
     return t;
   }
-  function freeTexture(file, keepBook) { const t = atlasTex.get(file); if (t) { t.dispose(); atlasTex.delete(file); } if (!keepBook) residency.drop(file); }
-  function evictStale(tNowS) { for (const f of residency.stale(tNowS)) { freeTexture(f, true); residency.drop(f); } }
+  function freeTexture(file, keepBook) { const t = atlasTex.get(file); if (t) { t.dispose(); atlasTex.delete(file); if (onPerf) onPerf('free', { file }); } pinned.delete(file); if (!keepBook) residency.drop(file); }
+  function evictStale(tNowS) { for (const f of residency.stale(tNowS)) { if (pinned.has(f)) continue; freeTexture(f, true); residency.drop(f); } }
+  /** a sheet drawn for real: a warmed sheet is no longer pinned (the normal stale rule applies from here) */
+  function drawTexture(file, tNowS) { const t = atlasTexture(file, tNowS); if (t && pinned.size && pinned.has(file)) pinned.delete(file); return t; }
   const anim = new Map(); // billboard id -> { key, since, x, z, t, speed, lod }
   const seenScratch = new Set(); // reused every frame (review BF S4)
   let lodT = -Infinity;
@@ -160,22 +166,25 @@ export function createRoomHook(opts = {}) {
   if (boxFile) preloadImage(boxFile);
   let boxArt = boxFile ? atlasTexture(boxFile, 0) : null; // usually still decoding here: sync() swaps the art in when it lands
   let boxFreed = false;
-  const boxMat = boxFile ? new MeshBasicMaterial({ map: boxArt, color: 0xc8a165 }) : new MeshBasicMaterial({ color: 0xc8a165 }); // cardboard colour until the art decodes (map x colour: set the colour white once the map lands)
+  // a 1 x 1 white map stands in until the art decodes, so the box material's shader program (USE_MAP) is the same before and after
+  // the swap: the swap is a texture bind, never a mid-play shader compile (CI #11 frame 9)
+  const whiteTex = boxFile ? new DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1, RGBAFormat, UnsignedByteType) : null; if (whiteTex) { whiteTex.colorSpace = SRGBColorSpace; whiteTex.needsUpdate = true; }
+  const boxMat = boxFile ? new MeshBasicMaterial({ map: boxArt || whiteTex, color: 0xc8a165 }) : new MeshBasicMaterial({ color: 0xc8a165 }); // cardboard colour until the art decodes (map x colour: set the colour white once the map lands)
   const bodyGeom = new BoxGeometry(BOX_SIZE_M, BOX_H, BOX_SIZE_M);
   if (boxFile) { const A = atlas.boxFace('side_a').uv, B = atlas.boxFace('side_b').uv, T = atlas.boxFace('top_closed').uv; [B, B, T, T, A, B].forEach((uv, i) => boxFaceUV(bodyGeom, i, uv)); }
   const boxBody = new Mesh(bodyGeom, boxMat);
   boxBody.position.y = BOX_H / 2; box.add(boxBody);
   const innerGeom = new BoxGeometry(BOX_SIZE_M * 0.92, BOX_H * 0.9, BOX_SIZE_M * 0.92);
   if (boxFile) { const W = atlas.boxFace('inner_wall').uv, F = atlas.boxFace('inner_floor').uv; [W, W, F, F, W, W].forEach((uv, i) => boxFaceUV(innerGeom, i, uv)); }
-  const boxInner = new Mesh(innerGeom, boxFile ? new MeshBasicMaterial({ map: boxArt, side: DoubleSide, color: 0xc8a165 }) : new MeshBasicMaterial({ color: 0x6b4a3a, side: DoubleSide })); // the inside, seen once the flaps are up
+  const boxInner = new Mesh(innerGeom, boxFile ? new MeshBasicMaterial({ map: boxArt || whiteTex, side: DoubleSide, color: 0xc8a165 }) : new MeshBasicMaterial({ color: 0x6b4a3a, side: DoubleSide })); // the inside, seen once the flaps are up
   boxInner.position.y = BOX_H * 0.5; boxInner.visible = false; box.add(boxInner);
   // two cardboard flaps hinged on the back / front top edges: each a thin box whose pivot group sits on the edge (hinge = the art's top edge)
   const flaps = [];
   for (const sgn of [-1, 1]) {
     const pivot = new Group(); pivot.position.set(0, BOX_H, sgn * BOX_SIZE_M / 2); box.add(pivot);
     const fg = new BoxGeometry(BOX_SIZE_M, 0.01, BOX_SIZE_M / 2);
-    if (boxArt) { const Fl = atlas.boxFace('flap').uv; for (let i = 0; i < 6; i++) boxFaceUV(fg, i, Fl); }
-    const flap = new Mesh(fg, boxArt ? boxMat : new MeshBasicMaterial({ color: 0xb08a50 }));
+    if (boxFile && atlas.boxFace('flap')) { const Fl = atlas.boxFace('flap').uv; for (let i = 0; i < 6; i++) boxFaceUV(fg, i, Fl); } // was gated on boxArt, which is still decoding here: the flaps never got the art
+    const flap = new Mesh(fg, boxFile ? boxMat : new MeshBasicMaterial({ color: 0xb08a50 }));
     flap.position.z = -sgn * BOX_SIZE_M / 4; pivot.add(flap); flaps.push({ pivot, sgn });
   }
   const boxOut = { jiggle: 0, squash: 0, lid: 0 };
@@ -196,8 +205,8 @@ export function createRoomHook(opts = {}) {
 
   // particles: one InstancedMesh per kind, instance count = the fx pool size (fixed, never grows); unused instances scale to 0
   const dummy = new Object3D();
-  const pools = {};
-  for (const kind of ['heart', 'dust', 'spark']) {
+  const pools = {}, POOL_KINDS = ['heart', 'dust', 'spark'], poolWasAlive = { heart: true, dust: true, spark: true };
+  for (const kind of POOL_KINDS) {
     const n = kind === 'heart' ? FX_TUNING.heartsMax : kind === 'dust' ? FX_TUNING.dustMax : FX_TUNING.sparkMax;
     const im = new InstancedMesh(new PlaneGeometry(1, 1), new MeshBasicMaterial({ map: particleTexture(kind), transparent: true, depthWrite: false, side: DoubleSide, alphaTest: 0.02 }), n);
     im.frustumCulled = false; im.renderOrder = 10; im.count = n;
@@ -216,6 +225,54 @@ export function createRoomHook(opts = {}) {
   // score card (Laser Tag): the same look as the end card, redrawn only when its lines change
   const scoreCard = makeCard(END_W, END_H * 0.8, 768); group.add(scoreCard.mesh);
   let scoreLines = '';
+
+  // ---- perf: warm-up during the scan window (CI #11 frames 8 / 9: 254 + 123 ms at 'room ready' = shader compiles + first texture
+  // uploads + the room build). warm(renderer, camera, scene) is called by the host on every frame BEFORE the room starts (the
+  // 1-8 s scan, where only the preview cat draws) and does ONE step per call: (1) renderer.compileAsync of every material in the
+  // hook's group (cats, box, cards, particles, dot, ring, wand: compile() walks invisible objects too; the GL link runs in parallel
+  // where KHR_parallel_shader_compile exists), (2) one GPU upload per frame: the particle / card canvases, the box sheet, then each
+  // of today's kittens' first sheets (side-walk hi + lo: the climb-out) through the same residency bookkeeping (<= 8 MB, box + 3 x
+  // 1.25 MB = 4.75 MB on day 1), pinned until first drawn. Returns true while work remains; a no-op after start.
+  const warmQueue = []; let warmed = false, warmSteps = 0, warmTries = 0;
+  function warm(renderer, camera, scene) {
+    if (disposed || !renderer) return false;
+    if (!warmed) {
+      warmed = true;
+      // today's billboards exist before the compile (their map + alphaTest program is the one every kitten draws with); hidden until sync()
+      for (const c of opts.cats || []) if (c && c.id != null) billboardFor(c.id, c.size).root.visible = false;
+      warmQueue.push(() => { if (typeof renderer.compileAsync === 'function') renderer.compileAsync(group, camera, scene || undefined).catch(() => {}); else if (typeof renderer.compile === 'function') renderer.compile(group, camera, scene || undefined); return 'compile'; });
+      // CB S3: inside an XR session, ALSO draw the (hidden) group once at zero scale so the XR variant of every program (multiview /
+      // the XR render target) is the one compiled; compileAsync alone compiles the non-XR variant when the two differ
+      warmQueue.push(() => {
+        const xr = renderer.xr; if (!(xr && xr.isPresenting && typeof renderer.render === 'function')) return 'draw:skipped';
+        const vis = []; group.traverse((o) => { if (o !== group) { vis.push([o, o.visible]); o.visible = true; } });
+        const sc = group.scale.clone(); group.scale.setScalar(1e-6); group.updateMatrixWorld(true);
+        const ac = renderer.autoClear; renderer.autoClear = false;
+        try { renderer.render(group, camera); } catch (e) { /* the XR frame may refuse a second render: compileAsync covered it */ } finally { renderer.autoClear = ac; group.scale.copy(sc); for (const [o, v] of vis) o.visible = v; group.updateMatrixWorld(true); }
+        return 'draw';
+      });
+      for (const tex of [pools.heart.material.map, pools.dust.material.map, pools.spark.material.map, card.tex, endCard.tex, scoreCard.tex, label.tex, whiteTex].filter(Boolean)) {
+        warmQueue.push(() => { if (typeof renderer.initTexture === 'function') renderer.initTexture(tex); return 'tex'; });
+      }
+      if (atlas) {
+        const sheets = [];
+        if (boxFile) sheets.push(boxFile);
+        // CB S1: only the hi sheet (the kittens climb out 0.6 m from the head = inside HI_WITHIN_M, so hi is what the LOD rule picks); any sheet still pinned 2 s after start is unpinned in sync()
+        for (const id of todayIds) { const r = atlas.resolveCat(id), S = r && M.cats[r] && M.cats[r].sheets && M.cats[r].sheets['side-walk']; if (S && S.hi && images.has(S.hi)) sheets.push(S.hi); }
+        for (const f of sheets) warmQueue.push(() => { if (atlasTex.has(f)) return 'sheet'; const t = atlasTexture(f, 0); if (!t) return null; pinned.add(f); return 'sheet:' + f; }); // null = not decoded yet / no slot: retry next frame
+      }
+    }
+    uploadsThisFrame = 0;
+    while (warmQueue.length) {
+      const t0 = now(); let r = null;
+      try { r = warmQueue[0](); } catch (e) { r = 'error'; }
+      if (r === null) { if (++warmTries > 600) warmQueue.shift(); return true; } // ~8 s of retries at most (the maxWaitS scan cap)
+      warmQueue.shift(); warmSteps++;
+      if (onPerf) onPerf('warm', { step: r, ms: +(now() - t0).toFixed(2) });
+      if (r !== 'sheet') return true; // one real step per frame
+    }
+    return false;
+  }
 
   function billboardFor(id, size) {
     let b = cats.get(id);
@@ -238,11 +295,12 @@ export function createRoomHook(opts = {}) {
     const tNow = now();
     const fx = result.fx, dir = result.director, t = bridge.time;
     uploadsThisFrame = 0;
+    if (pinned.size && t >= 2) pinned.clear(); // CB S1: nothing stays pinned past 2 s of play (the normal stale rule from here)
     // box: drops with a squash, jiggles while it waits, the flaps swing open on their hinges, the box leaves after the climb
     box.visible = !st.box.gone;
     if (boxFile && !boxFreed) {
       if (st.box.gone) { boxFreed = true; freeTexture(boxFile); boxArt = null; } // the box's 1 MB leaves with it (budget rule)
-      else { const bt = atlasTexture(boxFile, t); if (bt && bt !== boxArt) { boxArt = bt; for (const m of [boxMat, boxInner.material]) { m.map = bt; m.color.setHex(0xffffff); m.needsUpdate = true; } } }
+      else { const bt = drawTexture(boxFile, t); if (bt && bt !== boxArt) { boxArt = bt; for (const m of [boxMat, boxInner.material]) { m.map = bt; m.color.setHex(0xffffff); } } } // same program: no needsUpdate
     }
     if (box.visible) {
       boxAnim(st.box, fx ? fx.box : { landedAt: null, openedAt: null }, t, boxOut);
@@ -299,12 +357,13 @@ export function createRoomHook(opts = {}) {
         // camera's left) + rotDeg for the top view; the atlas only supplies the frame (side art faces right, top art head +x)
         f = atlas.getFrame(aid, c.sprite, pose, (tNow - a.since) / 1000, { lod: a.lod, speedMps: a.speed, flipX: !!c.flipX });
       }
-      let ftex = f ? atlasTexture(f.file, t) : null;
+      let ftex = f ? drawTexture(f.file, t) : null;
       if (f && !ftex) { // this sheet is not drawable yet (still decoding / no GPU room): the other lod, else the canvas sprite
         const g = atlas.getFrame(aid, c.sprite, pose, (tNow - anim.get(c.id).since) / 1000, { lod: f.lod === 'hi' ? 'lo' : 'hi', speedMps: anim.get(c.id).speed, flipX: !!c.flipX });
-        const gt = g ? atlasTexture(g.file, t) : null; if (gt) { f = g; ftex = gt; }
+        const gt = g ? drawTexture(g.file, t) : null; if (gt) { f = g; ftex = gt; }
       }
-      if (f && ftex) b.setAtlasFrame(f, ftex); else b.setAtlasFrame(null);
+      if (f && ftex) b.setAtlasFrame(f, ftex);
+      else if (!(f && b.atlasMode && b.holdFrame(t))) b.setAtlasFrame(null); // perf: a kitten already in atlas art keeps its LAST frame (<= 0.25 s) while the new sheet uploads, instead of a one-frame canvas placeholder (a 256 px canvas draw + upload mid-play, then back)
       b.update(tNow); // W3: per-sprite texture + crossfade (canvas sprites only)
       if (c.shadow) b.setShadow(c.shadow.y, c.shadow.alpha); else b.setShadow(null, 0);
     }
@@ -313,8 +372,12 @@ export function createRoomHook(opts = {}) {
     if (atlas) evictStale(t); // sheets not drawn for ~1 s leave the GPU (the image stays decoded in RAM: re-upload only)
     // particles: pool -> instance matrices (a quad facing the head, scaled by the particle's size x scale)
     if (fx) {
-      for (const kind of ['heart', 'dust', 'spark']) {
+      for (const kind of POOL_KINDS) {
         const ps = kind === 'heart' ? fx.hearts : kind === 'dust' ? fx.dust : fx.sparks, im = pools[kind];
+        // an empty pool is neither re-uploaded nor drawn (3 draw calls + 3 buffer uploads a frame saved while nothing is in the air)
+        const alive = ps.alive > 0;
+        if (!alive && !poolWasAlive[kind]) continue;
+        poolWasAlive[kind] = alive; im.visible = alive;
         for (let i = 0; i < ps.items.length; i++) {
           const p = ps.items[i];
           if (!p.alive || p.scale <= 0) { dummy.position.set(0, -10, 0); dummy.scale.set(0, 0, 0); }
@@ -348,19 +411,19 @@ export function createRoomHook(opts = {}) {
     const sc = dir && dir.scorecard;
     if (sc) {
       const key = sc.join('\n');
-      if (key !== scoreLines) { scoreLines = key; scoreCard.draw(sc, true); scoreCard.mesh.visible = true; }
+      if (key !== scoreLines) { scoreLines = key; scoreCard.draw(sc, true); scoreCard.mesh.visible = true; if (onPerf) onPerf('card', { which: 'score' }); }
       placeCard(scoreCard.mesh, head, gaze, CARD_AHEAD, 0.02);
     } else if (scoreCard.mesh.visible) { scoreCard.mesh.visible = false; scoreLines = ''; }
     // W3: hint / caption card (head-locked, under the gaze); the end card replaces it
     if (result.endCard) {
-      if (cardLines !== 'end') { cardLines = 'end'; endCard.draw(result.endCard.lines, true); endCard.mesh.visible = true; card.mesh.visible = false; }
+      if (cardLines !== 'end') { cardLines = 'end'; endCard.draw(result.endCard.lines, true); endCard.mesh.visible = true; card.mesh.visible = false; if (onPerf) onPerf('card', { which: 'end' }); }
       placeCard(endCard.mesh, head, gaze, CARD_AHEAD, 0.05);
     } else {
       const lines = [];
       if (result.hint) for (const l of String(result.hint.text).split('\n')) lines.push(l); // a two-line hint = two card lines at full size
       if (result.caption) lines.push(result.caption);
       const key = lines.join('\n');
-      if (key !== cardLines) { cardLines = key; card.draw(lines, false); card.mesh.visible = lines.length > 0; }
+      if (key !== cardLines) { cardLines = key; card.draw(lines, false); card.mesh.visible = lines.length > 0; if (onPerf) onPerf('card', { which: 'hint', lines: lines.length }); }
       if (card.mesh.visible) placeCard(card.mesh, head, gaze, CARD_AHEAD, CARD_BELOW);
     }
   }
@@ -381,6 +444,7 @@ export function createRoomHook(opts = {}) {
     cache.dispose();
     for (const t of atlasTex.values()) t.dispose(); atlasTex.clear(); images.clear(); anim.clear();
     box.traverse((o) => freeObject(o)); group.remove(box);
+    if (whiteTex) whiteTex.dispose(); // N1
     laser.traverse((o) => freeObject(o)); group.remove(laser);
     group.remove(targetRing); freeObject(targetRing);
     for (const kind in pools) { group.remove(pools[kind]); freeObject(pools[kind]); if (typeof pools[kind].dispose === 'function') pools[kind].dispose(); }
@@ -390,5 +454,5 @@ export function createRoomHook(opts = {}) {
     bridge.dispose();
   }
 
-  return { bridge, group, sync, cats, dispose, get disposed() { return disposed; }, get residency() { return { bytes: residency.bytes, files: residency.files, images: images.size, uploads }; } };
+  return { bridge, group, sync, warm, cats, dispose, get disposed() { return disposed; }, get residency() { return { bytes: residency.bytes, files: residency.files, images: images.size, uploads, pinned: pinned.size, warmSteps }; } };
 }

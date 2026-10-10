@@ -38,6 +38,8 @@ export const BRIDGE_TUNING = Object.freeze({
   settleS: 1.0,       // the scene must be unchanged this long before the room is built (planes refine for a while)
   noScanS: 3.0,       // nothing detected after this -> virtual rug (plan 1.1, never dead-end)
   maxWaitS: 8.0,      // a scene that keeps changing is used anyway after this
+  prebuildMoveM: 0.15, // start() reuses the half-settle prebuild only if the head moved less than this since it was built ...
+  prebuildTurnDeg: 12, // ... and turned less than this (createRoom places the box / rug / couch front from the viewer: Code Review CB M1)
   hands: ['left', 'right'],
   laserMaxM: 6,       // the finger laser ray reaches this far
   boxPinchM: 0.15,    // a NEW pinch opens the box only this close to its lid (roomcat's own rule is 0.3 m: pinches in the
@@ -424,7 +426,7 @@ export function createRoomBridge(opts = {}) {
     // P0a slice: the director (game beats + meter + Laser Tag) and fx (juice, particles, cues); slice = the 3-minute pacing
     director: null, fx: null, slice: opts.slice !== false, simEvents: [], ltCats: [], ltViews: {},
     _firstT: null, _accepted: null, _keyT: null, _lastScene: null, _lastViewer: null, _lastForward: null, _lastFloorY: 0, _liveAccepted: null,
-    _scratch: {}, _prevState: null, _fxPrev: null, _gest: [], _empty: [], _ltState: { cats: [] },
+    _scratch: {}, _prevState: null, _fxPrev: null, _gest: [], _empty: [], _ltState: { cats: [] }, _prebuilt: null, prebuilt: false,
   };
   for (const h of T.hands) b.gestures[h] = createGestureState(h);
 
@@ -440,20 +442,46 @@ export function createRoomBridge(opts = {}) {
     if (n > 0 && stable >= T.settleS) { b.ready = true; b.reason = 'settled'; }
     else if (n === 0 && since >= T.noScanS) { b.ready = true; b.reason = 'no_scan'; }
     else if (since >= T.maxWaitS) { b.ready = true; b.reason = 'timeout'; }
+    // perf (CI #11 frame 8: 254 ms at settle): build the room + session (createRoom + the detour grids = ~35 ms cold on x86, more on
+    // the Quest) SPECULATIVELY halfway through the settle second, on a scan frame where nothing else happens, keyed on the accepted
+    // snapshot; start() reuses it when the snapshot is still the same, so the first gameplay frame pays nothing for the room. A
+    // re-anchor drops the speculation (one build per accepted snapshot, never more often than every settleS / 2).
+    if (!b.ready && n > 0 && stable >= T.settleS * 0.5 && !(b._prebuilt && b._prebuilt.sig === b._accepted)) b._prebuilt = buildRoomAndSession(b._accepted);
   };
+  /** CB M1: the prebuild is only the room of the pose it was built from; reuse it if the head has not moved / turned since */
+  function prebuildFresh(pre) {
+    if (!pre || pre.sig == null || pre.sig !== b._accepted) return false;
+    const v0 = pre.input.viewer, v1 = b._lastViewer || { x: 0, z: 0 };
+    if (Math.hypot((v1.x || 0) - v0.x, (v1.z || 0) - v0.z) >= T.prebuildMoveM) return false;
+    const f0 = pre.input.forward, f1 = b._lastForward && (b._lastForward.x || b._lastForward.z) ? b._lastForward : { x: 0, z: -1 };
+    const l0 = Math.hypot(f0.x, f0.z) || 1, l1 = Math.hypot(f1.x, f1.z) || 1;
+    const cos = (f0.x * f1.x + f0.z * f1.z) / (l0 * l1);
+    return cos >= Math.cos(T.prebuildTurnDeg * Math.PI / 180);
+  }
 
-  b.start = () => {
+  /** the room + the deterministic session for the LAST observed scene (pure of bridge state: observe() prebuilds, start() applies) */
+  function buildRoomAndSession(sig) {
     const input = buildRoomInput(b._lastScene || { planes: [], meshes: [] }, b._lastViewer, b._lastForward, b._lastFloorY);
-    b.roomInput = input;
-    b.room = createRoom(input);
-    b._liveAccepted = b._accepted;
+    const room = createRoom(input);
     // W4 kitten memory (return-visit.js): a remembered kitten heads to its favourite spot in THIS room (matched by label)
     let cats = opts.cats == null ? 3 : opts.cats;
     if (opts.memory && Array.isArray(cats)) {
-      const fav = spotsForRoom(opts.memory, b.room, cats.map((c) => (c && c.id != null ? String(c.id) : '')));
+      const fav = spotsForRoom(opts.memory, room, cats.map((c) => (c && c.id != null ? String(c.id) : '')));
       cats = cats.map((c) => (c && fav[c.id] ? Object.assign({}, c, { napSurf: fav[c.id] }) : c));
     }
-    b.session = createRoomSession({ room: b.room, seed: opts.seed == null ? 1 : opts.seed, cats, size: opts.size || 'kitten', arc: opts.arc !== false });
+    const session = createRoomSession({ room, seed: opts.seed == null ? 1 : opts.seed, cats, size: opts.size || 'kitten', arc: opts.arc !== false });
+    return { sig, input, room, session };
+  }
+
+  b.start = () => {
+    const pre = prebuildFresh(b._prebuilt) ? b._prebuilt : buildRoomAndSession(b._accepted); // same scene AND same head pose (< 0.15 m, < 12 deg), else a fresh build (the old cost, never a stale box)
+    b.prebuilt = pre === b._prebuilt; // diagnostic: the speculative build was used
+    b._prebuilt = null;
+    const input = pre.input;
+    b.roomInput = input;
+    b.room = pre.room;
+    b._liveAccepted = b._accepted;
+    b.session = pre.session;
     b.loop.reset();
     b.state = b.session.state();
     b.time = 0; b.progress = createProgress(); b.hints = createHintState(); b.captions = createCaptionState(); b.hint = null; b.caption = null; b.endCard = null; b.memory = null; b._prevState = null;
@@ -562,7 +590,7 @@ export function createRoomBridge(opts = {}) {
   b.openBox = () => { if (b.session) b.session.openBox(); };
   b.dispose = () => {
     b.session = null; b.room = null; b.state = null; b.roomInput = null; b.ready = false; b.reason = null; b.disposed = true;
-    b._firstT = null; b._accepted = null; b._keyT = null; b._lastScene = null; b._liveAccepted = null; b.views = {};
+    b._firstT = null; b._accepted = null; b._keyT = null; b._lastScene = null; b._liveAccepted = null; b.views = {}; b._prebuilt = null;
     b.wand = null; b.hint = null; b.caption = null; b.endCard = null; b.memory = null; b._prevState = null; b._fxPrev = null; b.time = 0;
     b.director = null; b.fx = null; b.simEvents.length = 0; b.ltCats.length = 0;
     for (const h of T.hands) b.gestures[h] = createGestureState(h);
