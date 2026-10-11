@@ -72,7 +72,7 @@ export function createSessionLife(o) {
     life.sessionTime += inp.dt;
     const t = life.sessionTime;
     // controller hint (independent of the room state)
-    const show = hint.update(inp.kinds, t);
+    const show = hint.update(inp.kinds, t) && !inp.hud; // SK-HUD: with the action menu wired, controllers are a real input (no "put them down" hint)
     const bridge = life.hook.bridge;
     const onboarding = bridge.hint ? bridge.hint.text : null;
     showHint(show ? CONTROLLER_HINT : onboarding);
@@ -88,7 +88,7 @@ export function createSessionLife(o) {
       return null;
     }
     const hands = inp.refSpace && typeof o.readHands === 'function' ? o.readHands(inp.frame, inp.refSpace, t, life.handScratch) : [];
-    const result = bridge.frame(inp.dt, hands, inp.head, inp.gaze || null, 'postureFloorY' in inp ? inp.postureFloorY : inp.floorY);
+    const result = bridge.frame(inp.dt, hands, inp.head, inp.gaze || null, 'postureFloorY' in inp ? inp.postureFloorY : inp.floorY, inp.hud || null); // SK-HUD: inp.hud = { sources, hide, wristToggle } (main.js)
     life.hook.sync(result, inp.head, inp.gaze || null);
     if (result.hintChanged) showHint(show ? CONTROLLER_HINT : (result.hint ? result.hint.text : null));
     if (result.captionChanged) { life.caption = result.caption; onCaption(result.caption); }

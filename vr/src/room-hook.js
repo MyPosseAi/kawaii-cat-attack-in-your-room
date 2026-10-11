@@ -31,6 +31,8 @@ import { ART_MANIFEST } from './art-manifest.gen.js';
 import { artIdOf, artPose, boxFaceUV, createResidency } from './art-glue.js';
 import { LT_ROOM_STARTERS } from '../../game/core/lasertag-room.js';
 import { HAPPY_TUNING } from './director.js';
+import { Matrix4, Line, LineBasicMaterial, BufferGeometry, Float32BufferAttribute } from 'three';
+import { HUD_TUNING, hudLayout } from './hud-menu.js';
 import { DataTexture, ImageLoader, LinearFilter, RGBAFormat, Texture, UnsignedByteType } from 'three';
 
 const BOX_SIZE_M = 0.28; // roomcat: boxR 0.14, boxH 0.3
@@ -74,6 +76,16 @@ function makeCard(w, h, px) {
   };
   return { mesh, draw, tex };
 }
+
+/** SK-HUD: a canvas quad for the HUD (same dark rounded look as the cards). draw(fn) paints with fn(ctx, W, H). */
+function makeHudCanvas(w, h, px) {
+  const canvas = document.createElement('canvas'); canvas.width = px; canvas.height = Math.round(px * h / w);
+  const tex = new CanvasTexture(canvas); tex.colorSpace = SRGBColorSpace;
+  const mesh = new Mesh(new PlaneGeometry(w, h), new MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false, side: DoubleSide }));
+  mesh.visible = false;
+  return { mesh, tex, canvas, draw(fn) { const ctx = canvas.getContext('2d'); ctx.clearRect(0, 0, canvas.width, canvas.height); fn(ctx, canvas.width, canvas.height); tex.needsUpdate = true; } };
+}
+function hudRound(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r); ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h); ctx.lineTo(x + r, y + h); ctx.quadraticCurveTo(x, y + h, x, y + h - r); ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y); ctx.closePath(); }
 
 /**
  * createRoomHook({ seed, cats, size, arc, onLog, roster, visit, names, persisted, leftHanded, memory, draw }) -> { bridge, group, sync(result, head, gaze), cats, dispose() }
@@ -240,6 +252,20 @@ export function createRoomHook(opts = {}) {
   track.renderOrder = 998; fill.renderOrder = 999; meter.add(track); meter.add(fill);
   const label = makeCard(METER_W, 0.04, 384); label.draw(['Kitten Happiness'], false); label.mesh.visible = true; label.mesh.position.set(0, METER_H * 0.5 + 0.024, 0); meter.add(label.mesh);
   let meterShown = -1;
+  // SK-HUD: the quick-stat strip (always on, lazy-follow) + the action tiles (open menu) + one ray cursor per hand. Two canvas
+  // cards redrawn ONLY when their text / hover / active tile changes (user-driven, never a flash), placed from hud-menu.js's pose.
+  const HL = hudLayout(), HT = HUD_TUNING;
+  const hudStrip = makeHudCanvas(HT.stripW, HT.stripH, 640), hudTiles = makeHudCanvas(HL.gridW, HL.gridH, 640);
+  hudTiles.mesh.renderOrder = 1001; hudStrip.mesh.renderOrder = 1001; group.add(hudStrip.mesh); group.add(hudTiles.mesh);
+  const cursorGeo = new CircleGeometry(0.009, 20), cursorMat = new MeshBasicMaterial({ color: 0xfff3e6, transparent: true, opacity: 0.95, depthTest: false, depthWrite: false });
+  const hudCursors = { left: new Mesh(cursorGeo, cursorMat), right: new Mesh(cursorGeo, cursorMat) };
+  for (const k in hudCursors) { hudCursors[k].visible = false; hudCursors[k].renderOrder = 1002; group.add(hudCursors[k]); }
+  const hudM4 = new Matrix4(), hudR = new Vector3(), hudU = new Vector3(), hudN = new Vector3();
+  let hudStripKey = '', hudTilesKey = '';
+  // coach review MUST 1: a thin aim beam per hand / controller while the menu is open or the ray is near the panel
+  const beamMat = new LineBasicMaterial({ color: 0xfff3e6, transparent: true, opacity: 0.7, depthTest: false, depthWrite: false });
+  const mkBeam = () => { const g = new BufferGeometry(); g.setAttribute('position', new Float32BufferAttribute(new Float32Array(6), 3)); const l = new Line(g, beamMat); l.visible = false; l.frustumCulled = false; l.renderOrder = 1002; group.add(l); return l; };
+  const hudBeams = { left: mkBeam(), right: mkBeam() };
   // score card (Laser Tag): the same look as the end card, redrawn only when its lines change
   const scoreCard = makeCard(END_W, END_H * 0.8, 768); group.add(scoreCard.mesh);
   let scoreLines = '';
@@ -380,7 +406,7 @@ export function createRoomHook(opts = {}) {
         const g = atlas.getFrame(aid, c.sprite, pose, (tNow - anim.get(c.id).since) / 1000, { lod: f.lod === 'hi' ? 'lo' : 'hi', speedMps: anim.get(c.id).speed, flipX: !!c.flipX });
         const gt = g ? drawTexture(g.file, t) : null; if (gt) { f = g; ftex = gt; }
       }
-      if (f && ftex) { b.setAtlasFrame(f, ftex); const a = anim.get(c.id); if (a) a.shown = { cat: f.cat, view: f.view, anim: f.anim, index: f.index, count: f.count, sheet: f.sheet, lod: f.lod, file: f.file, rect: f.rect, uv: f.uv, flipX: f.flipX, flipY: ftex.flipY, kind: imageKind(ftex.image), sprite: c.sprite, pose }; }
+      if (f && ftex) { b.setAtlasFrame(f, ftex); const a = anim.get(c.id); if (a) { const sh = a.shown || (a.shown = {}); sh.cat = f.cat; sh.view = f.view; sh.anim = f.anim; sh.index = f.index; sh.count = f.count; sh.sheet = f.sheet; sh.lod = f.lod; sh.file = f.file; sh.rect = f.rect; sh.uv = f.uv; sh.flipX = f.flipX; sh.flipY = ftex.flipY; sh.kind = imageKind(ftex.image); sh.sprite = c.sprite; sh.pose = pose; } } // CG NIT: reuse the record (no per-kitten object per frame)
       else if (!(f && b.atlasMode && b.holdFrame(t))) b.setAtlasFrame(null); // perf: a kitten already in atlas art keeps its LAST frame (<= 0.25 s) while the new sheet uploads, instead of a one-frame canvas placeholder (a 256 px canvas draw + upload mid-play, then back)
       b.update(tNow); // W3: per-sprite texture + crossfade (canvas sprites only)
       if (c.shadow) b.setShadow(c.shadow.y, c.shadow.alpha); else b.setShadow(null, 0);
@@ -411,6 +437,61 @@ export function createRoomHook(opts = {}) {
       placeCard(meter, head, gaze, CARD_AHEAD, CARD_BELOW - METER_ABOVE);
       if (dir.meter !== meterShown) { meterShown = dir.meter; fill.scale.x = Math.max(0.0001, dir.meter); fill.material.color.setHex(dir.meterFull ? 0xffe08a : 0xff9ec7); }
     } else meter.visible = false;
+    // SK-HUD: quick-stat strip + action tiles + ray cursors (hud-menu.js visual via bridge.frame's result.hud)
+    const hud = result.hud, hv = hud && hud.visual;
+    if (hv && !hv.hidden && hv.placed) {
+      const P = hv.pose;
+      hudR.set(P.r.x, P.r.y, P.r.z); hudU.set(P.u.x, P.u.y, P.u.z); hudN.set(P.n.x, P.n.y, P.n.z);
+      hudM4.makeBasis(hudR, hudU, hudN);
+      hudStrip.mesh.quaternion.setFromRotationMatrix(hudM4); hudStrip.mesh.position.set(P.c.x, P.c.y, P.c.z); hudStrip.mesh.visible = true;
+      const sk = hud.stats.key + '|' + hv.hoverTip + '|' + (hv.button.hover ? 1 : 0) + (hv.open ? 1 : 0);
+      if (sk !== hudStripKey) {
+        hudStripKey = sk;
+        hudStrip.draw((ctx, W, H) => {
+          const bw = W * HT.btnW / HT.stripW;
+          ctx.fillStyle = 'rgba(29, 22, 38, 0.86)'; hudRound(ctx, 0, 0, W - bw - 6, H, H * 0.22); ctx.fill();
+          ctx.fillStyle = '#fff3e6'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+          ctx.font = `700 ${Math.round(H * 0.36)}px system-ui, sans-serif`; ctx.fillText(hud.stats.line1, H * 0.25, H * 0.3, W - bw - H * 0.5);
+          ctx.font = `600 ${Math.round(H * 0.32)}px system-ui, sans-serif`; ctx.fillText(hv.hoverTip || hud.stats.line2, H * 0.25, H * 0.72, W - bw - H * 0.5); // the hovered tile's tip replaces line 2
+          ctx.fillStyle = hv.button.hover ? '#fff3e6' : hv.open ? '#ff9ec7' : 'rgba(29, 22, 38, 0.86)'; hudRound(ctx, W - bw, 0, bw, H, H * 0.22); ctx.fill();
+          ctx.strokeStyle = '#ff9ec7'; ctx.lineWidth = H * 0.06; hudRound(ctx, W - bw + 2, 2, bw - 4, H - 4, H * 0.2); ctx.stroke();
+          ctx.fillStyle = hv.button.hover || hv.open ? '#1d1626' : '#fff3e6'; ctx.textAlign = 'center';
+          ctx.font = `700 ${Math.round(H * 0.36)}px system-ui, sans-serif`; ctx.fillText(hv.open ? 'Close' : 'Menu', W - bw / 2, H / 2, bw * 0.9);
+        });
+        if (onPerf) onPerf('card', { which: 'hud' });
+      }
+      if (hv.open) {
+        const cu = HT.stripH / 2 + HT.gap + HL.gridH / 2; // the grid centre sits this far above the strip centre
+        hudTiles.mesh.quaternion.copy(hudStrip.mesh.quaternion);
+        hudTiles.mesh.position.set(P.c.x + P.u.x * cu, P.c.y + P.u.y * cu, P.c.z + P.u.z * cu); hudTiles.mesh.visible = true;
+        let tk = ''; for (const t of hv.tiles) tk += (t.hover ? 'h' : '-') + (t.pressed ? 'p' : '-') + (t.active ? 'a' : '-') + (t.disabled ? 'd' : '-');
+        if (tk !== hudTilesKey) {
+          hudTilesKey = tk;
+          hudTiles.draw((ctx, W, H) => {
+            const sx = W / HL.gridW, sy = H / HL.gridH;
+            for (const t of hv.tiles) {
+              const x = (t.u - HT.tileW / 2 + HL.gridW / 2) * sx, y = (HL.gridH / 2 - (t.v - (HT.stripH / 2 + HT.gap + HL.gridH / 2)) - HT.tileH / 2) * sy, w = HT.tileW * sx, h = HT.tileH * sy;
+              ctx.globalAlpha = t.disabled ? 0.45 : 1;
+              ctx.fillStyle = t.pressed ? '#ffd1e3' : t.active ? '#ff9ec7' : t.hover ? '#4a3a5c' : 'rgba(29, 22, 38, 0.9)'; hudRound(ctx, x, y, w, h, h * 0.18); ctx.fill();
+              if (t.hover) { ctx.strokeStyle = '#fff3e6'; ctx.lineWidth = h * 0.08; hudRound(ctx, x + h * 0.04, y + h * 0.04, w - h * 0.08, h - h * 0.08, h * 0.16); ctx.stroke(); }
+              ctx.fillStyle = t.active || t.pressed ? '#1d1626' : '#fff3e6'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+              ctx.font = `700 ${Math.round(h * 0.26)}px system-ui, sans-serif`; ctx.fillText(t.label, x + w / 2, y + h * 0.42, w * 0.9);
+              ctx.font = `600 ${Math.round(h * 0.15)}px system-ui, sans-serif`; ctx.fillText(t.active ? 'ON' : t.disabled ? 'not yet' : '', x + w / 2, y + h * 0.75, w * 0.9);
+            }
+            ctx.globalAlpha = 1;
+          });
+          if (onPerf) onPerf('card', { which: 'hud-tiles' });
+        }
+      } else hudTiles.mesh.visible = false;
+      for (const k in hudCursors) {
+        const cp = hv.cursors[k], m = hudCursors[k];
+        if (cp) { m.visible = true; m.position.set(cp.x + P.n.x * 0.003, cp.y + P.n.y * 0.003, cp.z + P.n.z * 0.003); m.quaternion.copy(hudStrip.mesh.quaternion); } else m.visible = false;
+      }
+      for (const k in hudBeams) {
+        const bm = hv.beams ? hv.beams[k] : null, l = hudBeams[k];
+        if (bm && bm.show) { const a = l.geometry.attributes.position; a.setXYZ(0, bm.o.x, bm.o.y, bm.o.z); a.setXYZ(1, bm.e.x, bm.e.y, bm.e.z); a.needsUpdate = true; l.visible = true; } else l.visible = false;
+      }
+    } else { hudStrip.mesh.visible = false; hudTiles.mesh.visible = false; hudCursors.left.visible = false; hudCursors.right.visible = false; hudBeams.left.visible = false; hudBeams.right.visible = false; }
     // W3: wand + basket (wand.js view)
     const w = result.wand;
     if (w) {
@@ -467,7 +548,9 @@ export function createRoomHook(opts = {}) {
     group.remove(targetRing); freeObject(targetRing);
     for (const kind in pools) { group.remove(pools[kind]); freeObject(pools[kind]); if (typeof pools[kind].dispose === 'function') pools[kind].dispose(); }
     meter.traverse((o) => freeObject(o)); group.remove(meter);
-    for (const o of [basket, stick, feather, card.mesh, endCard.mesh, scoreCard.mesh]) { group.remove(o); freeObject(o); }
+    for (const o of [basket, stick, feather, card.mesh, endCard.mesh, scoreCard.mesh, hudStrip.mesh, hudTiles.mesh]) { group.remove(o); freeObject(o); }
+    group.remove(hudCursors.left); group.remove(hudCursors.right); cursorGeo.dispose(); cursorMat.dispose();
+    for (const k in hudBeams) { group.remove(hudBeams[k]); hudBeams[k].geometry.dispose(); } beamMat.dispose(); // SK-HUD (shared geometry / material: freed once)
     if (group.parent) group.parent.remove(group);
     bridge.dispose();
   }

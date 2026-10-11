@@ -618,7 +618,7 @@ export function createRoomSession(opts = {}) {
     const vx = (L.x - ox) / win, vz = (L.z - oz) / win, trav = rcLen(vx, vz) * T.tellS, held = trav < T.leadDeadM;
     const lead = held ? 0 : T.pounceLeadS, er = held ? 0 : trav * T.aimErr * Math.sqrt(prng.next()), ea = held ? 0 : prng.next() * 6.2831853; // (a held dot: no prng draw, aimed exactly)
     let ax = L.x, az = L.z;
-    if (held) { let n = 0, sx = 0, sz = 0; for (let i = 0; i < T.heldMeanN; i++) { const q = (s.tick - i + s.laserHistN) % s.laserHistN; if (s.laserHS[q] !== L.surf) break; sx += s.laserHX[q]; sz += s.laserHZ[q]; n++; } if (n) { ax = sx / n; az = sz / n; } } // a held dot: aim at its recent MEAN (the jitter averages out; CK S1)
+    if (held) { let n = 0, sx = 0, sz = 0; for (let i = 0; i < T.heldMeanN; i++) { const q = (s.tick - i + s.laserHistN) % s.laserHistN; if (s.laserHS[q] !== L.surf) break; sx += s.laserHX[q]; sz += s.laserHZ[q]; n++; } if (n) { ax = sx / n + vx * (n - 1) / 2 * STEP_S; az = sz / n + vz * (n - 1) / 2 * STEP_S; } } // CM SHOULD: the mean lags a slow dot by (n-1)/2 steps; add that back // a held dot: aim at its recent MEAN (the jitter averages out; CK S1)
     let x = ax + vx * lead + er * Math.cos(ea), z = az + vz * lead + er * Math.sin(ea), d = rcLen(x - c.x, z - c.z);
     if (d > T.pounceReach) { const k = T.pounceReach / d; x = c.x + (x - c.x) * k; z = c.z + (z - c.z) * k; }
     if (!legalAt(c, x, z)) { x = L.x; z = L.z; d = rcLen(x - c.x, z - c.z); if (d > T.pounceReach) { const k = T.pounceReach / d; x = c.x + (x - c.x) * k; z = c.z + (z - c.z) * k; } if (!legalAt(c, x, z)) { x = c.x; z = c.z; } }

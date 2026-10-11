@@ -25,11 +25,15 @@ import { placeBasket, createWandState, wandStep, wandView } from './wand.js';
 import { createProgress, progressStep, createHintState, hintStep, soundCues, createCaptionState, captionStep } from './hints.js';
 import { buildEndCard, endCardDue } from './end-card.js';
 import { rememberSession, spotsForRoom } from './return-visit.js';
-import { createDirector, directorRoute, directorStep, ltStep, ltCatRecords, ltDot, offerRing, pointRay, HAPPY_TUNING, DIRECTOR_TEXT } from './director.js';
+import { createDirector, directorRoute, directorStep, ltStep, ltCatRecords, ltDot, offerRing, pointRay, startLaserTag, HAPPY_TUNING, DIRECTOR_TEXT } from './director.js';
+import { createHudMenu, hudMenuStep, hudToolEvents, hudFilterEvents, createLaserGate, laserGateFilter, hudStats, HUD_ACTIONS, HUD_CAPTIONS } from './hud-menu.js';
+const HUD_ACTION_LABEL = Object.fromEntries(HUD_ACTIONS.map((a) => [a.id, a.label]));
+const HUD_ACTION_TIP = Object.fromEntries(HUD_ACTIONS.map((a) => [a.id, a.tip]));
 import { createFx, fxStep } from './fx.js';
 import { HINTS_SLICE, HINT_TUNING_SLICE } from './hints.js';
 
-export const BRIDGE_VERSION = 5; // 5: head events to roomcat (CH M1). 2: laser clipped by walls / furniture sides, box pinch 0.15 m, treat view gate, input hint
+export const BRIDGE_VERSION = 6; // 6: SK-HUD quick-stat strip + action menu (hud-menu.js): controller ray + trigger / hand ray + pinch / poke pick the tool; hand-aware laser off
+                                 // // 5: head events to roomcat (CH M1). 2: laser clipped by walls / furniture sides, box pinch 0.15 m, treat view gate, input hint
                                  // 3 (W3): posture-aware treat (floorY), feather wand + basket, onboarding hints + captions, end card
                                  // 4 (P0a slice): roomcat v2 events collected per step (simEvents), the director (Happiness meter,
                                  //    celebration, Laser Tag beat on game/core/lasertag-room.js with the Play sim frozen) and fx
@@ -429,6 +433,7 @@ export function createRoomBridge(opts = {}) {
     // P0a slice: the director (game beats + meter + Laser Tag) and fx (juice, particles, cues); slice = the 3-minute pacing
     director: null, fx: null, slice: opts.slice !== false, simEvents: [], ltCats: [], ltViews: {},
     _firstT: null, _accepted: null, _keyT: null, _lastScene: null, _lastViewer: null, _lastForward: null, _lastFloorY: 0, _liveAccepted: null,
+    hud: null, _hudHead: { p: null, fwd: null }, _hudMerge: [], _laserGate: createLaserGate(), _hudTctx: { head: null, floorY: 0, targets: null, grabs: null, dt: 0, forceLaser: false }, _hudEnabled: { laser_tag: false },
     _scratch: {}, _prevState: null, _fxPrev: null, _gest: [], _empty: [], _ltState: { cats: [] }, _prebuilt: null, prebuilt: false, _headSent: null, _headFwd: { x: 0, z: -1 },
   };
   for (const h of T.hands) b.gestures[h] = createGestureState(h);
@@ -491,6 +496,7 @@ export function createRoomBridge(opts = {}) {
     b.wand = createWandState(placeBasket(b.room, input.viewer, input.forward, input.floorY, !!opts.leftHanded));
     b.director = createDirector({ room: b.room, seed: opts.seed == null ? 1 : opts.seed, viewer: input.viewer, forward: input.forward });
     b.fx = createFx(opts.seed == null ? 1 : opts.seed);
+    b.hud = createHudMenu(); b._laserGate = createLaserGate(); // SK-HUD: a fresh menu per session (tool = Laser)
     b.simEvents = []; b.ltCats = []; b.ltViews = {}; b._fxPrev = null; b._headSent = null; b._headFwd.x = input.forward.x; b._headFwd.z = input.forward.z;
     if (onLog) {
       const legal = b.room.surfaces.filter((s) => s.legal).map((s) => `${s.kind}:${s.label}`).join(', ');
@@ -502,7 +508,7 @@ export function createRoomBridge(opts = {}) {
   /** dt seconds; handSamples from readHands (or tests); camera head { x, y, z }; gaze unit direction (optional); floorY
    *  (optional: the treat's lap line is posture-aware with it, seated without it) */
   const EMPTY = Object.freeze({ cats: [], views: {}, state: null, events: [], simEvents: [], wand: null, hint: null, hintChanged: false, caption: null, captionChanged: false, endCard: null, memory: null, fx: null, director: null });
-  b.frame = (dt, handSamples, camera, gaze, floorY) => {
+  b.frame = (dt, handSamples, camera, gaze, floorY, hudIn) => {
     if (!b.session) return EMPTY;
     b.time += dt;
     const D = b.director, route = directorRoute(D);
@@ -530,10 +536,32 @@ export function createRoomBridge(opts = {}) {
     }
     const byHand = {};
     for (const s of handSamples || []) if (s && b.gestures[s.hand]) byHand[s.hand] = s;
+    // SK-HUD: the quick-stat strip + action menu. hudIn = { sources: { left, right } (hud-menu.js source shape), hide, wristToggle }
+    // from the host (main.js reads the WebXR input sources); null = no HUD this frame (tests / old hosts: the bridge runs as before)
+    let hm = null;
+    const srcs = hudIn && hudIn.sources ? hudIn.sources : null;
+    if (b.hud && srcs && camera) {
+      for (const h of T.hands) { const sc = srcs[h]; if (sc && sc.kind === 'hand' && !sc.tip && byHand[h] && byHand[h].joints) sc.tip = byHand[h].joints['index-finger-tip'] || null; }
+      b._hudHead.p = camera; b._hudHead.fwd = fwd;
+      b._hudEnabled.laser_tag = D.mode === 'offer' || D.mode === 'scorecard';
+      hm = hudMenuStep(b.hud, { t: b.time, dt, head: b._hudHead, sources: srcs, hide: !!b.endCard || !!hudIn.hide, wristToggle: !!hudIn.wristToggle, enabled: b._hudEnabled });
+      for (const e of hm.events) if (e.type === 'command' && e.action === 'laser_tag' && (D.mode === 'offer' || D.mode === 'scorecard')) startLaserTag(D);
+      const tc = b._hudTctx; tc.forceLaser = route === 'lt'; tc.head = b._hudHead; // GO1 SHOULD 1: in Laser Tag the controller trigger aims the dot whatever the tool
+       tc.floorY = b.roomInput ? b.roomInput.floorY : 0; tc.targets = targets; tc.dt = dt;
+      tc.grabs = b.state && b.hud.active === 'toss' ? b.state.cats.filter((c) => c.mode !== 'inbox' && c.mode !== 'carried').map((c) => ({ x: c.x, y: c.y + (ROOMCAT_SIZES[c.size] || ROOMCAT_SIZES.kitten).scruff, z: c.z })) : null;
+    }
     for (const h of T.hands) {
       const r = gestureStep(b.gestures[h], byHand[h] || null, targets, null, view);
       b.gestures[h] = r.state;
-      for (const ev of r.events) {
+      let hev = r.events;
+      if (hm) { // the active tool's events join the hand's own, then the menu's suppression (the menu click never reaches a cat)
+        const m = b._hudMerge; let k = 0;
+        for (const e of r.events) m[k++] = e;
+        for (const e of hudToolEvents(b.hud, h, srcs[h] || null, b._hudTctx)) m[k++] = e;
+        m.length = k;
+        hev = hudFilterEvents(b.hud, m);
+      }
+      for (const ev of hev) {
         gest.push(ev);
         if (route === 'lt') continue; // Laser Tag: the Play sim is frozen; the point ray goes to lasertag-room below
         // the wand sees every gesture first: a pinch at its handle picks it up (that pinch is not a scruff / box pinch)
@@ -557,6 +585,7 @@ export function createRoomBridge(opts = {}) {
       bb = catsToBillboards(b._ltState, b.room, camera || { x: 0, y: 1.2, z: 0 }, b.views);
     } else {
       b.wand = wandStep(b.wand, null, wctx).state; // time-only rules (a dropped wand returns to the basket)
+      laserGateFilter(b._laserGate, events); // roomcat has ONE dot: an off from the hand that does not own it is dropped (Review row 451)
       if (n > 0) {
         b.session.step(events); // all of this frame's events apply on its first step (logged with that tick)
         for (const ev of b.session.events) simEvents.push(ev);
@@ -589,6 +618,10 @@ export function createRoomBridge(opts = {}) {
     else b.hint = hr.hint;
     const hintChanged = (before && before.text) !== (b.hint && b.hint.text);
     const cues = n > 0 ? soundCues(b.state, b._prevState) : [];
+    if (hm) for (const e of hm.events) { // SK-HUD captions: the picked tool / a greyed tile (captions only, no sound)
+      const line = e.type === 'tool' ? HUD_ACTION_LABEL[e.action] + ': ' + HUD_ACTION_TIP[e.action] : e.type === 'blocked' ? HUD_CAPTIONS.blocked : null;
+      if (line) { b.captions = Object.assign({}, b.captions, { text: null, since: null }); cues.unshift(line); }
+    }
     if (D.caption) { b.captions = Object.assign({}, b.captions, { text: null, since: null }); cues.unshift(D.caption); } // a moment ("Gotcha!", "Whisker-close! +N") beats a sound caption at once
     const cr = captionStep(b.captions, cues, b.time, b.slice ? HINT_TUNING_SLICE : undefined);
     b.captions = cr.state; b.caption = cr.caption;
@@ -601,7 +634,8 @@ export function createRoomBridge(opts = {}) {
       if (onLog) onLog('end card');
     }
     const dir = { mode: dmode, route, meter: D.meter.value, meterFull: D.meter.full, celebrate: D.celebrate, scorecard: D.scorecard, hud: D.hud, dot: route === 'lt' ? dotNow : null, ring: offerRing(D), best: D.best, round: D.ltRound };
-    return { cats: bb.cats, views: bb.views, state: b.state, events, simEvents, wand: route === 'lt' ? null : wandView(b.wand), hint: b.hint, hintChanged, caption: b.caption, captionChanged: cr.changed, endCard: b.endCard, memory: b.memory, fx: b.fx, director: dir };
+    const hud = hm ? { visual: hm.visual, events: hm.events, haptics: hm.haptics, stats: hudStats(dir, b.state, b.hud.active) } : null;
+    return { cats: bb.cats, views: bb.views, state: b.state, events, simEvents, wand: route === 'lt' ? null : wandView(b.wand), hint: b.hint, hintChanged, caption: b.caption, captionChanged: cr.changed, endCard: b.endCard, memory: b.memory, fx: b.fx, director: dir, hud };
   };
 
   b.openBox = () => { if (b.session) b.session.openBox(); };
@@ -609,7 +643,7 @@ export function createRoomBridge(opts = {}) {
     b.session = null; b.room = null; b.state = null; b.roomInput = null; b.ready = false; b.reason = null; b.disposed = true;
     b._firstT = null; b._accepted = null; b._keyT = null; b._lastScene = null; b._liveAccepted = null; b.views = {}; b._prebuilt = null;
     b.wand = null; b.hint = null; b.caption = null; b.endCard = null; b.memory = null; b._prevState = null; b._fxPrev = null; b.time = 0;
-    b.director = null; b.fx = null; b.simEvents.length = 0; b.ltCats.length = 0;
+    b.director = null; b.fx = null; b.hud = null; b.simEvents.length = 0; b.ltCats.length = 0;
     for (const h of T.hands) b.gestures[h] = createGestureState(h);
   };
   return b;

@@ -70,7 +70,10 @@ export const GESTURE_TUNING = Object.freeze({
   // player (head 1.35: tall adult, high stool) seated, so a palm on the lap stays a resting hand. A 13-year-old standing
   // at eye height 1.28 is classed seated: a reach-down to the floor gives no treat (seated-first; noted for QA).
   viewConeDeg: 45, lapBelowM: 0.45, lapSlackM: 0.1, seatedMaxM: 1.4, standOnM: 1.45, seatedOnM: 1.25, standBelowM: 0.8, standMinM: 0.7,
-  petVMin: 0.05, petVMax: 0.4, petNear: 0.25, petFar: 0.35, petFace: 0.2, petHoldS: 0.4, petGraceS: 0.2,
+  petVMin: 0.0, petVMax: 0.4, petNear: 0.25, petFar: 0.35, petFace: 0.2, petHoldS: 0.4, petGraceS: 0.2, petCloseM: 0.08,
+  // GO1 fix round (owner Quest test 03:55 "petting doesn't work"): petVMin 0.05 -> 0 (a hand resting on / slowly patting a kitten pauses; any
+  // pause under 5 cm/s reset the 0.4 s start clock and a still hand ended the pet), and within petCloseM (8 cm) of the back the
+  // palm-facing test is waived (a hand beside / level with a 14 cm-high kitten back faced sideways and never counted)
 });
 
 function gLen(x, y, z) { return Math.sqrt(x * x + y * y + z * z); }
@@ -287,7 +290,7 @@ export function gestureStep(prev, sample, targets, tuning, view) {
   if (st.palm) return { state: st, events, features: feat };
 
   // ---- pet: open hand, slow stroke near a target, palm facing it
-  const facing = (i) => { const q = targets[i]; const d = gNorm(gSub(q, feat.palm)); return gDot(d, feat.normal) >= T.petFace; };
+  const facing = (i) => { const q = targets[i]; if (gDist(feat.palm, q) <= T.petCloseM) return true; const d = gNorm(gSub(q, feat.palm)); return gDot(d, feat.normal) >= T.petFace; };
   if (st.pet) {
     let i = st.petTarget;
     if (!(i >= 0 && targets && gOk(targets[i]) && gDist(feat.palm, targets[i]) <= T.petFar)) i = nearestTarget(feat.palm, targets, T.petFar);
@@ -297,7 +300,7 @@ export function gestureStep(prev, sample, targets, tuning, view) {
     else events.push({ type: 'pet_hold', hand, p: feat.palm, target: st.petTarget, v });
   } else {
     const i = nearestTarget(feat.palm, targets, T.petNear);
-    const shape = i >= 0 && openCount(true) >= T.palmFingers && speed >= T.petVMin && speed <= T.petVMax && facing(i);
+    const shape = i >= 0 && openCount(true) >= T.palmFingers && speed >= T.petVMin && speed <= T.petVMax && feat.normal.y < 0.5 && facing(i); // palm up = the treat, never a pet
     if (shape) {
       if (st.petSince == null) st.petSince = t;
       if (t - st.petSince >= T.petHoldS) { st.pet = true; st.petLost = null; st.petTarget = i; events.push({ type: 'pet_start', hand, p: feat.palm, target: i, v }); }

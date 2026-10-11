@@ -15,6 +15,13 @@ export function hapticTargets(inputSources) {
   }
   return out;
 }
+/** SK-HUD: one pulse on the controller of `hand` ('left' | 'right') only (menu hover tick / click). Not rate-limited here:
+ *  hud-menu.js only asks on a NEW hover target or a select. Returns 1 when pulsed, else 0 (hands / no actuator). */
+export function pulseHand(inputSources, hand, strength, ms) {
+  if (!inputSources || !(strength > 0)) return 0;
+  for (const t of hapticTargets(inputSources)) if (t.handedness === hand) { try { t.actuator.pulse(Math.min(1, strength), Math.max(HAPTIC_TUNING.minMs * 0.5, Math.min(HAPTIC_TUNING.maxMs, ms || HAPTIC_TUNING.minMs))); return 1; } catch (e) { return 0; } }
+  return 0;
+}
 /** Fresh limiter state. */
 export function createHaptics() { return { lastMs: -Infinity, pulses: 0 }; }
 /** Pulse every controller: strength 0..1 (0 = nothing), nowMs for the rate limit. Returns the number of actuators pulsed. */

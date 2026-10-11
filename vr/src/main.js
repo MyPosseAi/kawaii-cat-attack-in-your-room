@@ -30,7 +30,7 @@ import { log } from './log.js';
 // P0a slice (docs/P0A-SLICE.md GE2): synthesised WebAudio cues (sound.js; the context is made on the Enter tap, a user
 // gesture) and controller haptics (haptics.js) for the fx.js cue list the bridge returns every frame. Zero files, zero network.
 import { createSound } from './sound.js';
-import { createHaptics, hapticPulse } from './haptics.js';
+import { createHaptics, hapticPulse, pulseHand } from './haptics.js';
 import { ART_MANIFEST } from './art-manifest.gen.js'; // Design's 8 starter kittens: ids + names (the roster)
 
 const CAT_DISTANCE_M = 0.9; // pre-XR desktop preview spot (in reach while seated)
@@ -223,6 +223,12 @@ class RoomCatSystem extends createSystem({
     this.life.watchSession(session);
     if (fresh) { sound.resume(); this.lastMode = null; setDevPlaying(true); } // a new XR session: audio running, in play until the first rest
     if (!session && this.lastMode !== null) { this.lastMode = null; setDevPlaying(false); }
+    if (fresh && typeof session.addEventListener === 'function') {
+      // SK-HUD: the trigger (controllers) / pinch (hands) state per input source for the action menu + tools
+      const sel = this.hudSel = new WeakMap();
+      session.addEventListener('selectstart', (e) => sel.set(e.inputSource, true));
+      session.addEventListener('selectend', (e) => sel.set(e.inputSource, false));
+    }
     if (fresh && DEV && typeof session.addEventListener === 'function') {
       session.addEventListener('selectstart', (e) => log(`select start (${e.inputSource.hand ? 'hand' : 'controller'} ${e.inputSource.handedness})`));
     }
@@ -236,6 +242,35 @@ class RoomCatSystem extends createSystem({
     // DEV perf split: this system's time per XR frame + the render time of the PREVIOUS render call (render runs after the systems)
     const P = this.perf, t0 = P.now(); if (P.first == null) P.first = t0;
     try { this.updateXR(delta, frame); } finally { P.sim.push(P.now() - t0); P.render.push(P.lastRenderMs); P.t.push(t0); P.lastRenderMs = 0; if (P.sim.length > 20000) { P.sim.shift(); P.render.shift(); P.t.shift(); } }
+  }
+
+  /** SK-HUD: the WebXR input sources -> hud-menu.js sources { left, right } (reused scratch; the bridge adds hand fingertips).
+   *  ray = targetRaySpace (origin + -Z), select = selectstart / selectend, button = xr-standard 3 (thumbstick click) / 4 / 5 (X Y / A B). */
+  readHud(frame, ref) {
+    const mk = () => ({ kind: 'controller', ray: { o: { x: 0, y: 0, z: 0 }, d: { x: 0, y: 0, z: -1 } }, select: false, button: false, tip: null, grip: { x: 0, y: 0, z: 0 } });
+    const S = this.hudScratch || (this.hudScratch = { sources: { left: null, right: null }, slots: { left: mk(), right: mk() }, hide: false, wristToggle: false });
+    S.sources.left = null; S.sources.right = null;
+    const session = frame && frame.session;
+    if (!session || !ref || typeof frame.getPose !== 'function') return S;
+    for (const src of session.inputSources) {
+      const h = src.handedness === 'left' ? 'left' : src.handedness === 'right' ? 'right' : null;
+      if (!h || !src.targetRaySpace || S.sources[h]) continue;
+      let pose = null; try { pose = frame.getPose(src.targetRaySpace, ref); } catch (e) { pose = null; }
+      if (!pose) continue;
+      const m = pose.transform.matrix, slot = S.slots[h];
+      slot.ray.o.x = m[12]; slot.ray.o.y = m[13]; slot.ray.o.z = m[14];
+      slot.ray.d.x = -m[8]; slot.ray.d.y = -m[9]; slot.ray.d.z = -m[10];
+      slot.kind = src.hand ? 'hand' : 'controller';
+      slot.select = !!(this.hudSel && this.hudSel.get(src));
+      const b = !src.hand && src.gamepad ? src.gamepad.buttons : null;
+      slot.button = !!(b && ((b[3] && b[3].pressed) || (b[4] && b[4].pressed) || (b[5] && b[5].pressed)));
+      slot.tip = null;
+      let g = null; if (src.gripSpace) { try { g = frame.getPose(src.gripSpace, ref); } catch (e) { g = null; } }
+      const gp = g ? g.transform.position : null;
+      slot.grip.x = gp ? gp.x : m[12]; slot.grip.y = gp ? gp.y : m[13]; slot.grip.z = gp ? gp.z : m[14];
+      S.sources[h] = slot;
+    }
+    return S;
   }
 
   updateXR(delta, frame) {
@@ -269,8 +304,11 @@ class RoomCatSystem extends createSystem({
     const result = this.life.step({
       dt: delta, frame, refSpace: ref,
       head: { x: head.x, y: head.y, z: head.z }, fwd: { x: fwd.x, z: fwd.z }, gaze: { x: gaze.x, y: gaze.y, z: gaze.z },
-      floorY, postureFloorY, kinds: inputKinds(frame.session),
+      floorY, postureFloorY, kinds: inputKinds(frame.session), hud: this.readHud(frame, ref),
     });
+    if (result && result.hud) for (const h of result.hud.haptics) pulseHand(frame.session.inputSources, h.hand, h.strength, h.ms); // SK-HUD hover tick / click
+    if (result && result.hud) for (const e of result.hud.events) { if (e.type === 'select') sound.play('tick'); else if (e.type === 'blocked') sound.play('pat'); } // commit / greyed sounds (hands too; silent before the Enter tap)
+    if (DEV && result && result.hud) for (const e of result.hud.events) if (e.type === 'select' || e.type === 'menu_open' || e.type === 'menu_close') log(`hud: ${e.type}${e.action ? ' ' + e.action : ''} ${e.hand || ''}`);
     if (DEV && this.perf && this.perf.programsAtStart == null && this.life.started) { this.perf.programsAtStart = this.perf.info ? this.perf.info.programs : -1; this.perf.event('started', { programs: this.perf.programsAtStart, prebuilt: !!this.life.hook.bridge.prebuilt }); }
     if (DEV && result) for (const ev of result.events) if (ev.type === 'pinch' || ev.type === 'release' || ev.type === 'treat' || ev.type === 'wand') log(`${ev.type}${ev.on === false ? ' off' : ''} ${ev.hand || ''}`);
     // P0a: this frame's cues -> sound (synth) + controller haptics (hands have none); DEV logs the beat changes only

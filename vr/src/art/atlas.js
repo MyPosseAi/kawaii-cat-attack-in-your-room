@@ -23,6 +23,8 @@ export const ANIM_ALIAS = Object.freeze({
   pounce: 'pounce', hop: 'pounce', crouch: 'pounce:hold0', tell: 'pounce:hold0',
   purr: 'purr', petted: 'purr', loaf: 'purr',
   sleep: 'sleep', nap: 'sleep',
+  // roomcat v5 idle cycle (owner's Quest test 2026-10-10 fixes): no groom / stretch art yet -> nearest existing frames
+  groom: 'sit', stretch: 'pounce:hold0', pause: 'idle',
 });
 const RUN_FPS_X = 1.8; // run / trot / fall play the walk cycle faster when no speed is given
 
