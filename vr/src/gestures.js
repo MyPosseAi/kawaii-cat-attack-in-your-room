@@ -7,10 +7,10 @@
    Output of gestureStep: { state, events, features }. Events (one hand each):
      { type: 'move', hand, p }                     every tracked frame (host contract, plan 2.9): p = pinch point while
                                                    pinching, else the palm centre
-     { type: 'pinch_start' | 'pinch_hold' | 'pinch_release', hand, p, v? }   thumb tip to index tip < pinchOn (1.5 cm), off
-                                                   above pinchOff (2.5 cm); v = mean palm velocity over the last velFrames
+     { type: 'pinch_start' | 'pinch_hold' | 'pinch_release', hand, p, v? }   thumb tip to index tip < pinchOn (2.0 cm), off
+                                                   above pinchOff (3.5 cm); v = mean palm velocity over the last velFrames
      { type: 'point_start' | 'point_hold' | 'point_end', hand, origin, dir }   index straight + middle / ring / pinky curled
-                                                   for pointHoldS: a laser ray from the index tip
+                                                   for pointHoldS: a laser ray from the index tip along knuckle -> tip, EMA-smoothed (rayEma)
      { type: 'palm_start' | 'palm_hold' | 'palm_end', hand, p, normal }       open hand, palm facing UP, still for palmHoldS
                                                    (treat); once on, the palm may move (the cat follows it). With a `view`
                                                    ({ head, gaze, floorY }) it only STARTS while the palm is inside the head's
@@ -22,9 +22,13 @@
      { type: 'lost', hand }                         tracking lost (every active gesture ends first: a pinch releases at v = 0)
    Hysteresis everywhere (on / off thresholds + grace times), ONE gesture active per hand (pinch > point > palm > pet). */
 
-export const GESTURES_VERSION = 4; // 2: straightness from the knuckle, palm normal from the knuckles, view / lap gate
+export const GESTURES_VERSION = 5; // 2: straightness from the knuckle, palm normal from the knuckles, view / lap gate
                                    // 3: posture-aware lap line (seated / standing), softer open-palm straightness (W3)
                                    // 4: posture hysteresis (standOnM / seatedOnM), seatedMaxM 1.4 (Code Review B 07:2x)
+                                   // 5 (GDXE / GE1, owner's Quest test 2026-10-10): pinchOn 2.0 cm / pinchOff 3.5 cm (joint CENTRES of touching
+                                   //    pads sit 1.5-2 cm apart on Quest: 1.5 cm needed a squeeze), the laser ray runs knuckle -> tip (8 cm,
+                                   //    not the 4.7 cm distal joint -> tip: 3 mm of joint jitter was 7 deg = a 25 cm dot jump at 2 m) and is
+                                   //    smoothed (rayEma) while pointing, so a held dot stays inside roomcat's escapeM / catchR
 
 /** WebXR Hand Input joint names (25), in the XRHand iteration order. */
 export const JOINTS = Object.freeze([
@@ -44,7 +48,8 @@ const FINGERS = Object.freeze({
 });
 
 export const GESTURE_TUNING = Object.freeze({
-  pinchOn: 0.015, pinchOff: 0.025, velFrames: 6, maxDt: 0.1,
+  pinchOn: 0.02, pinchOff: 0.035, velFrames: 6, maxDt: 0.1,
+  rayEma: 0.3, // per-frame blend of the new finger direction into the held laser ray (0.3 at 72 Hz = ~40 ms lag; std of frame-independent jitter x 0.42; Review CH S3: tuned on the jitter test in vr/test/gestures-jitter.test.mjs with roomcat's laserSmooth / leadDeadM)
   // finger straightness = (tip - knuckle) projected on the metacarpal direction / (sum of the 3 phalanx lengths):
   // ~1 straight, ~0.8 at a 40 deg first bend, ~0.5 half curled, 0 folded into a fist (the metacarpal never counts)
   // the POINTING index stays strict (a deliberate point is a straight finger); an OFFERED / stroking palm is softer
@@ -113,7 +118,7 @@ export function handFeatures(joints, hand) {
     pinchP: { x: (tt.x + it.x) / 2, y: (tt.y + it.y) / 2, z: (tt.z + it.z) / 2 },
     palm, normal, ext,
     indexTip: gPt(it),
-    indexDir: gNorm(gSub(it, gOk(iint) ? iint : joints['index-finger-phalanx-proximal'] || wrist)),
+    indexDir: gNorm(gSub(it, gOk(ikn) ? ikn : gOk(iint) ? iint : wrist)), // knuckle -> tip: the whole finger aims, not the last 4.7 cm
   };
 }
 
@@ -124,6 +129,7 @@ export function createGestureState(hand) {
     pinch: false, point: false, palm: false, pet: false,
     pointSince: null, pointLost: null, palmSince: null, palmLost: null, petSince: null, petLost: null, petTarget: -1,
     hist: [], // last velFrames palm samples [{ t, p }]
+    rayDir: null, // the smoothed laser direction while pointing (rayEma)
     v: { x: 0, y: 0, z: 0 }, // smoothed palm velocity (m/s)
     posture: null, // last lap-line posture ('seated' / 'standing'), the hysteresis memory
   };
@@ -240,11 +246,14 @@ export function gestureStep(prev, sample, targets, tuning, view) {
 
   // ---- point (index out, the other three curled)
   const pointShape = (on) => extended('index', on) && curled('middle', on) && curled('ring', on) && curled('pinky', on);
-  const ray = { origin: feat.indexTip, dir: feat.indexDir };
+  let dir = feat.indexDir;
+  if (st.point && st.rayDir && Number.isFinite(T.rayEma) && T.rayEma < 1) { const a = T.rayEma, r = st.rayDir; dir = gNorm({ x: r.x + (dir.x - r.x) * a, y: r.y + (dir.y - r.y) * a, z: r.z + (dir.z - r.z) * a }); }
+  const ray = { origin: feat.indexTip, dir };
+  st.rayDir = dir;
   if (st.point) {
     if (pointShape(false)) st.pointLost = null;
     else if (st.pointLost == null) st.pointLost = t;
-    if (st.pointLost != null && t - st.pointLost >= T.pointGraceS) { st.point = false; st.pointLost = null; st.pointSince = null; events.push({ type: 'point_end', hand }); }
+    if (st.pointLost != null && t - st.pointLost >= T.pointGraceS) { st.point = false; st.pointLost = null; st.pointSince = null; st.rayDir = null; events.push({ type: 'point_end', hand }); }
     else events.push(Object.assign({ type: 'point_hold', hand }, ray));
   } else if (!st.palm && !st.pet) {
     if (pointShape(true)) {

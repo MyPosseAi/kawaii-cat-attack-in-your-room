@@ -29,7 +29,7 @@ import { createDirector, directorRoute, directorStep, ltStep, ltCatRecords, ltDo
 import { createFx, fxStep } from './fx.js';
 import { HINTS_SLICE, HINT_TUNING_SLICE } from './hints.js';
 
-export const BRIDGE_VERSION = 4; // 2: laser clipped by walls / furniture sides, box pinch 0.15 m, treat view gate, input hint
+export const BRIDGE_VERSION = 5; // 5: head events to roomcat (CH M1). 2: laser clipped by walls / furniture sides, box pinch 0.15 m, treat view gate, input hint
                                  // 3 (W3): posture-aware treat (floorY), feather wand + basket, onboarding hints + captions, end card
                                  // 4 (P0a slice): roomcat v2 events collected per step (simEvents), the director (Happiness meter,
                                  //    celebration, Laser Tag beat on game/core/lasertag-room.js with the Play sim frozen) and fx
@@ -45,6 +45,9 @@ export const BRIDGE_TUNING = Object.freeze({
   boxPinchM: 0.15,    // a NEW pinch opens the box only this close to its lid (roomcat's own rule is 0.3 m: pinches in the
                       // 0.15..0.3 m ring are swallowed here so a stray pinch near the box cannot pop it open)
   hintAfterS: 2.0,    // controllers tracked and no hands for this long -> "Put your controllers down" hint
+  headMoveM: 0.1, headTurnDeg: 15, // a { type: 'head' } event goes to roomcat (logged) when the head moved / turned this much (Review CH M1)
+  headFlatMin: 0.35,  // the gaze's flat (xz) length must be at least this (pitch shallower than ~70 deg) to count as a forward for the head
+                      // event; looking steeply down the xz part is noise, so the LAST GOOD forward is kept and only the move rule can fire (CK M1)
   shadowMaxDrop: 2.5, // contact shadow fades out over this drop (airborne / carried cats)
 });
 
@@ -426,7 +429,7 @@ export function createRoomBridge(opts = {}) {
     // P0a slice: the director (game beats + meter + Laser Tag) and fx (juice, particles, cues); slice = the 3-minute pacing
     director: null, fx: null, slice: opts.slice !== false, simEvents: [], ltCats: [], ltViews: {},
     _firstT: null, _accepted: null, _keyT: null, _lastScene: null, _lastViewer: null, _lastForward: null, _lastFloorY: 0, _liveAccepted: null,
-    _scratch: {}, _prevState: null, _fxPrev: null, _gest: [], _empty: [], _ltState: { cats: [] }, _prebuilt: null, prebuilt: false,
+    _scratch: {}, _prevState: null, _fxPrev: null, _gest: [], _empty: [], _ltState: { cats: [] }, _prebuilt: null, prebuilt: false, _headSent: null, _headFwd: { x: 0, z: -1 },
   };
   for (const h of T.hands) b.gestures[h] = createGestureState(h);
 
@@ -488,7 +491,7 @@ export function createRoomBridge(opts = {}) {
     b.wand = createWandState(placeBasket(b.room, input.viewer, input.forward, input.floorY, !!opts.leftHanded));
     b.director = createDirector({ room: b.room, seed: opts.seed == null ? 1 : opts.seed, viewer: input.viewer, forward: input.forward });
     b.fx = createFx(opts.seed == null ? 1 : opts.seed);
-    b.simEvents = []; b.ltCats = []; b.ltViews = {}; b._fxPrev = null;
+    b.simEvents = []; b.ltCats = []; b.ltViews = {}; b._fxPrev = null; b._headSent = null; b._headFwd.x = input.forward.x; b._headFwd.z = input.forward.z;
     if (onLog) {
       const legal = b.room.surfaces.filter((s) => s.legal).map((s) => `${s.kind}:${s.label}`).join(', ');
       onLog(`room built (${b.reason}): ${input.planes.length} planes, ${input.meshes.length} meshes${b.room.rug ? ', virtual rug' : ''}; legal: ${legal || 'none'}`);
@@ -511,6 +514,20 @@ export function createRoomBridge(opts = {}) {
     if (gaze && (Math.abs(gaze.x) > 1e-6 || Math.abs(gaze.z) > 1e-6)) fwd = { x: gaze.x, z: gaze.z };
     const wctx = { room: b.room, forward: fwd, t: b.time };
     const events = [], gest = b._gest; gest.length = 0;
+    // CH M1: the player's body for roomcat (keep-out column, "in front of you" curiosity stop): a logged head event on the first frame
+    // and whenever the head moved headMoveM or turned headTurnDeg since the last one (not every frame: the log stays small)
+    if (route !== 'lt' && camera && Number.isFinite(camera.x) && Number.isFinite(camera.z)) {
+      const hs = b._headSent;
+      // the forward: the flat gaze when it is long enough to mean a direction (CK M1), else the last good one (the build forward at first)
+      const flatOk = !gaze || Math.hypot(gaze.x, gaze.z) >= T.headFlatMin;
+      let fx, fz;
+      if (flatOk) { const fl = Math.hypot(fwd.x, fwd.z) || 1; fx = fwd.x / fl; fz = fwd.z / fl; b._headFwd.x = fx; b._headFwd.z = fz; }
+      else { fx = b._headFwd.x; fz = b._headFwd.z; }
+      if (!hs || Math.hypot(camera.x - hs.x, camera.z - hs.z) >= T.headMoveM || fx * hs.fx + fz * hs.fz < Math.cos(T.headTurnDeg * Math.PI / 180)) {
+        if (!hs) b._headSent = { x: camera.x, z: camera.z, fx, fz }; else { hs.x = camera.x; hs.z = camera.z; hs.fx = fx; hs.fz = fz; } // (no per-frame allocation: the event itself is the only object, and only on a change)
+        events.push({ type: 'head', p: { x: camera.x, y: Number.isFinite(camera.y) ? camera.y : 0, z: camera.z }, f: { x: fx, z: fz } });
+      }
+    }
     const byHand = {};
     for (const s of handSamples || []) if (s && b.gestures[s.hand]) byHand[s.hand] = s;
     for (const h of T.hands) {

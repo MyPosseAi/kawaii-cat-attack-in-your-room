@@ -22,6 +22,11 @@
                                         makes a cat tell (leapTellS) then BIG LEAP to the highest legal surface it can reach
      { type: 'treat', on, hand, p }     open palm treat: the nearest awake cat comes; palm low enough = hops ONTO the hand
      { type: 'open_box' }               the host's open-box button (session.openBox() queues it, so the log replays it)
+     { type: 'head', p, f? }            the player's head (p: x, z used; f: flat forward { x, z }), sent by the host when it moved / turned
+                                        (Review CH M1): a keepOutM column around it that no idle / curious / home / wander target or
+                                        walk leg enters, and no such target within behindM BEHIND the player; the curiosity stop sits on
+                                        the far side of the hand from the body (in view). Until the first head event the room's build
+                                        viewer / forward stand in. Logged like any event: the replay is exact.
    The 10-minute arc (plan 1.3; arc: true): box drops on the floor in front of the viewer, opens on a pinch (or after
    15 s), kittens climb out 5 at a time (waves every 2.5 s), play until 7:30, zoomies, then each cat walks to a nap spot
    (couch seat, then bed, then floor / rug) and naps; phase 'end' at 10:00.
@@ -46,6 +51,13 @@
    Grounded cats ALWAYS stand on a legal room surface (feet y = surface y exactly, footprint legal with ROOM_LIMITS.catR);
    airborne = 'hop' | 'fly'; 'carried' / 'onhand' = the hand is the support; 'inbox' = the box floor; 'tell' (crouch) and
    'pin' (holding the caught dot) are grounded.
+   "Behave like cats" (GDXE / GE1 2026-10-10, after the owner's Quest test of 6c06c90: "did not behave much like cats"): idle is a CYCLE
+   (sit / loaf / groom / stretch / stand-and-look, 1.5-4.5 s bouts), walks are SHORT (<= wanderMaxM) and end in a stand-and-look pause
+   (no gliding across the room), hops between surfaces are rare; CURIOSITY: a hand seen within curiousM in the last curiousAgeS draws an
+   idle kitten to curiousStopM short of the point under it, where it sits facing the hand; HOME: a kitten farther than homeM from the box
+   spot (= in front of the player) walks back; a stroked kitten turns to the hand (lean in); the laser chase SLOWS to a stalk inside
+   stalkM before the crouch tell; a played-with kitten with no hearts left and no hand seen for dozeAfterS DOZES (pose 'nap', mode 'idle')
+   and any hand / laser / treat wakes it (it stretches first). All of it seeded: the replay hash still pins it.
    Build rule: only `export function` / `export const`; private names carry the `rc` prefix. */
 import { createPrng, createHasher } from './prng.js';
 import { STEP_S } from './loop.js';
@@ -58,9 +70,24 @@ export const ROOMCAT_SIZES = Object.freeze({
 });
 export const ROOMCAT_TUNING = Object.freeze({
   g: 9.81, floatG: 1.6, tossCap: 1.6, hopClear: 0.1, maxFlyS: 4,
-  pinchR: 0.1, petR: 0.2, petCdS: 0.5, pounceR: 0.14, batR: 0.28, treatR: 0.13, handHop: 0.5, eatS: 2,
+  pinchR: 0.1, petR: 0.25, petCdS: 0.5, pounceR: 0.14, batR: 0.28, treatR: 0.13, handHop: 1.0, eatS: 2,
+  // petR 0.2 -> 0.25 = gestures.js petNear (a stroke the gesture accepts always purrs); handHop 0.5 -> 1.0: the treat gesture only STARTS
+  // above the lap line (seated head - 0.45 m ~ 0.75 m, standing >= 0.7 m above the floor), so a floor kitten could never reach a palm
+  // it was allowed to see (it begged forever, no 'eat', no meter); a kitten now hops up to a palm at hip height (owner's Quest test fix)
   boxDropS: 0.35, boxDropH: 0.6, boxAutoOpenS: 15, waveSize: 5, waveS: 2.5, waveStaggerS: 0.2, boxH: 0.3, boxR: 0.14,
-  playEndS: 450, zoomiesS: 20, endS: 600, interest: 0.75, maxCats: 24,
+  playEndS: 450, zoomiesS: 20, endS: 600, interest: 1.0, maxCats: 24, // interest 0.75 -> 1.0: with 3 kittens one in four ignored the dot for the whole visit ("they don't chase it")
+  // "behave like cats" (GDXE / GE1 2026-10-10; see the header): idle cycle, short walks + pauses, curiosity, home, stalk, doze
+  wanderMaxM: 1.2, pauseS0: 0.4, pauseS1: 1.4, idleS0: 1.5, idleS1: 4.5, hopP: 0.12, stretchS: 1.2,
+  curiousM: 2.5, curiousAgeS: 3, curiousP: 0.45, curiousStopM: 0.3, lookS0: 1.0, lookS1: 2.5, curiousDetourCdS: 2, hopOverN: 400, smoothLook: 10,
+  homeM: 1.6, homeP: 0.6,
+  stalkM: 0.55, stalkV: 0.45,
+  dozeAfterS: 20, dozeS0: 6, dozeS1: 12,
+  // Review CH S3 (hand-tracking jitter): the pounce LEAD reads the dot's velocity over the last leadWinS (a ring of per-step dot
+  // positions), not over the 0.25 s tell: 3 mm of joint jitter through the ray is 2-5 cm of random "travel" per tell (x1.24 lead = a
+  // miss every time, catches 1-6 %) but only ~0.07 m/s over half a second; a dot whose lead travel (v x tellS) is under leadDeadM is
+  // HELD: aimed exactly, no scatter. The dot itself is never smoothed (the catch / escape geometry stays raw and testable).
+  leadWinS: 0.5, leadDeadM: 0.05, heldMeanN: 8,
+  keepOutM: 0.4, behindM: 1.0, // Review CH M1: the player's body column (no kitten target / walk leg inside), and no target within behindM behind the head
   // review fixes: fallback hops (twist / off the hand) are not snaps: at most floatV (poof float) or hopV m/s across,
   // never longer than maxSafeS; a hand that sends nothing for handLostS lets go of its cat; a cat leaves a palm after onhandMaxS
   floatV: 1.2, hopV: 3, maxSafeS: 3.5, handLostS: 3, onhandMaxS: 12,
@@ -157,7 +184,10 @@ export function createRoomSession(opts = {}) {
     tick: 0, phase: arc ? 'drop' : 'play', phaseT: 0, openTick: -1,
     box: { x: boxSpot.x, y: boxSpot.y + (arc ? T.boxDropH : 0), z: boxSpot.z, surf: boxSpot.surf, landed: !arc, open: !arc, gone: !arc },
     laser: null, wand: null, treat: null, hands: {}, log: [], queue: [], napTaken: [], napSpots: null,
-    cats: [], out: [], combo: [], comboCd: 0,
+    cats: [], out: [], combo: [], comboCd: 0, lastHandTick: -1e9,
+    head: { x: room.viewer ? room.viewer.x : 0, z: room.viewer ? room.viewer.z : 0, fx: room.forward ? room.forward.x : 0, fz: room.forward ? room.forward.z : -1 },
+    laserHistN: Math.round(ROOMCAT_TUNING.leadWinS / STEP_S) + 1, // the dot per step over the last leadWinS (CH S3), as a preallocated ring (CK S2: no per-step object)
+    laserHX: new Float64Array(Math.round(ROOMCAT_TUNING.leadWinS / STEP_S) + 1), laserHZ: new Float64Array(Math.round(ROOMCAT_TUNING.leadWinS / STEP_S) + 1), laserHS: new Array(Math.round(ROOMCAT_TUNING.leadWinS / STEP_S) + 1).fill(null),
   };
   const emit = (ev) => { s.out.push(ev); };
   list.forEach((d, i) => {
@@ -167,6 +197,7 @@ export function createRoomSession(opts = {}) {
       goal: 'wander', nap: null, eat: 0, hand: null, onT: 0, wave: Math.floor(i / T.waveSize), slot: i % T.waveSize, cool: 0, lastHop: 0,
       tell: 0, tellKind: null, tellX: 0, tellZ: 0, pin: 0, mute: 0, leapCool: 0, leap: null,
       hearts: 0, heartT: 0, treatCd: 0, peeked: false, detourCd: 0, detourTo: null, dotX0: 0, dotZ0: 0, hardT: [], sulk: 0, tossHard: false, nmTick: -1e9,
+      played: 0, wake: false, curDetCd: 0, // played = deeds that landed on this kitten (purr / eat / catch / gentle toss); wake = just woke from a doze (stretch first)
       napSurf: typeof d.napSurf === 'string' && d.napSurf ? d.napSurf : null };
     if (arc) { c.x = s.box.x + (prng.next() - 0.5) * 0.12; c.z = s.box.z + (prng.next() - 0.5) * 0.12; c.y = s.box.y; c.surf = 'box'; }
     else { const p = prng.pick(floor.spots); c.x = p.x; c.z = p.z; c.y = floor.y; c.surf = floor.id; c.mode = 'idle'; c.pose = 'sit'; c.t = RC_T(prng.range(0.2, 1.5)); }
@@ -212,7 +243,7 @@ export function createRoomSession(opts = {}) {
   // sulkS (ignores pinches, walks to a far spot, gentle pose; never a hurt state) and says so once
   const rcAfterToss = (c) => {
     if (c.hardT.length >= T.hardTossN && !c.sulk) { c.sulk = RC_T(T.sulkS); c.hardT.length = 0; c.plan = []; c.t = RC_T(0.3); c.pose = 'loaf'; emit({ type: 'wander_off', cat: c.id, s: T.sulkS }); return; }
-    if (!c.sulk && !c.tossHard) { c.purr = RC_T(1.2); }
+    if (!c.sulk && !c.tossHard) { c.purr = RC_T(1.2); c.played++; }
   };
   const hearts = (c, n) => { c.hearts = Math.min(T.heartsMax, c.hearts + n); c.heartT = RC_T(T.heartsDecayS); return c.hearts; };
   // plan a route; validated first with no allocation (failed plans, e.g. a chase that cannot reach the dot, are the
@@ -265,7 +296,7 @@ export function createRoomSession(opts = {}) {
     if (!found) return null;
     const path = []; for (let k = b; k >= 0; k = prev[k]) path.unshift(S[k]);
     const out = []; let cur = { x: c.x, z: c.z }, i = 0; // smoothing: from cur, skip to the farthest path point in a legal line
-    while (i < path.length) { let j = path.length - 1; while (j > i && !roomLineLegal(room, surf.id, cur, path[j], ROOM_LIMITS.catR + RC_SLACK)) j--; out.push({ x: path[j].x, z: path[j].z }); cur = path[j]; i = j + 1; }
+    while (i < path.length) { let j = Math.min(path.length - 1, i + T.smoothLook); while (j > i && !roomLineLegal(room, surf.id, cur, path[j], ROOM_LIMITS.catR + RC_SLACK)) j--; out.push({ x: path[j].x, z: path[j].z }); cur = path[j]; i = j + 1; } // (CH S1: the look-ahead is capped at smoothLook samples: the line checks per leg are bounded, a long straight stays a few short legs)
     out.push({ x, z }); return out;
   };
   // the floor is cut in two (a couch + a table leave no corridor): hop ONTO a legal surface the kitten can reach from where it
@@ -279,7 +310,10 @@ export function createRoomSession(opts = {}) {
       let b1 = null, d1 = c.lim.gap; // take-off from where the cat stands onto the nearest sample of S within the hop gap
       for (const q of S.samples) { const d = rcLen(q.x - c.x, q.z - c.z); if (d <= d1) { d1 = d; b1 = q; } }
       if (!b1) continue;
-      for (const f of here.samples) { // the landing back on c.surf: near the goal, within the gap of some sample of S
+      // CH S1 (cost bound): at most ~hopOverN landing candidates per surface (every stride-th sample of a big floor; a 0.1 m grid
+      // becomes a 0.2-0.3 m one for the landing choice), was every sample x every sample of S: 12 ms spikes
+      const HS = here.samples, stride = Math.max(1, Math.ceil(HS.length / T.hopOverN));
+      for (let fi = 0; fi < HS.length; fi += stride) { const f = HS[fi]; // the landing back on c.surf: near the goal, within the gap of some sample of S
         const dg = rcLen(x - f.x, z - f.z); if (dg >= 2.5 || d1 + dg >= bd) continue;
         let b2 = null, d2 = c.lim.gap; for (const q of S.samples) { const d = rcLen(q.x - f.x, q.z - f.z); if (d <= d2) { d2 = d; b2 = q; } }
         if (!b2 || !roomLineLegal(room, e1.to, b1, b2)) continue;
@@ -356,6 +390,8 @@ export function createRoomSession(opts = {}) {
   const apply = (ev) => {
     const h = ev.hand || 'r';
     if (ev.type === 'move' || ev.type === 'pinch' || ev.type === 'treat') if (ev.p) s.hands[h] = { x: ev.p.x, y: ev.p.y, z: ev.p.z, tick: s.tick };
+    if (ev.type === 'head') { if (ev.p) { s.head.x = +ev.p.x || 0; s.head.z = +ev.p.z || 0; } if (ev.f && (ev.f.x || ev.f.z)) { const l = rcLen(ev.f.x, ev.f.z); s.head.fx = ev.f.x / l; s.head.fz = ev.f.z / l; } return; }
+    if (ev.type !== 'open_box' && (ev.p || ev.type === 'release' || ev.on === false)) { s.lastHandTick = s.tick; rcWake(); }
     if (ev.type === 'pinch' && ev.p) {
       if (s.box.landed && !s.box.open && d3(ev.p, { x: s.box.x, y: s.box.y + T.boxH, z: s.box.z }) <= 0.3) { rcOpen(); return; }
       let best = null, bd = T.pinchR;
@@ -372,8 +408,8 @@ export function createRoomSession(opts = {}) {
         if (c.mode === 'carried' || c.mode === 'inbox' || c.mode === 'hop' || c.mode === 'fly') continue;
         const b = { x: c.x, y: c.y + c.lim.h * 0.8, z: c.z };
         if (d3(ev.p, b) <= T.petR) {
-          c.purr = RC_T(1.2);
-          if (c.petCd <= 0) { c.bond++; c.petCd = RC_T(T.petCdS); emit({ type: 'purr', cat: c.id, hearts: hearts(c, 1), bond: c.bond }); }
+          c.purr = RC_T(1.2); rcFace(c, ev.p.x - c.x, ev.p.z - c.z); // leans into the hand: turns to it
+          if (c.petCd <= 0) { c.bond++; c.played++; c.petCd = RC_T(T.petCdS); emit({ type: 'purr', cat: c.id, hearts: hearts(c, 1), bond: c.bond }); }
           if (c.mode !== 'nap' && c.mode !== 'onhand' && c.mode !== 'pin') { c.mode = 'idle'; c.pose = 'petted'; c.plan = []; c.t = RC_T(1.2); }
         }
       }
@@ -397,6 +433,28 @@ export function createRoomSession(opts = {}) {
     }
   };
   function rcOpen() { s.box.open = true; s.openTick = s.tick; s.phase = 'climb'; emit({ type: 'box_lid' }); }
+  // a hand is back (any hand event): dozing kittens stir within 0.5-1.5 s and stretch when they get up
+  function rcWake() { for (const c of s.cats) if (c.mode === 'idle' && c.pose === 'nap') { if (c.t > RC_T(1.5)) c.t = RC_T(prng.range(0.5, 1.5)); c.wake = true; } }
+  // Review CH M1: the player's body. rcClear = (x, z) is outside the keep-out column and not within behindM behind the player;
+  // rcSegClear = the walk leg a -> b never passes inside the column (a leg that STARTS inside is allowed out); rcPlanClear = every leg
+  const rcClear = (x, z) => {
+    const H = s.head, dx = x - H.x, dz = z - H.z, d2 = dx * dx + dz * dz;
+    if (d2 < T.keepOutM * T.keepOutM) return false;
+    return !(d2 < T.behindM * T.behindM && dx * H.fx + dz * H.fz < 0);
+  };
+  const rcSegClear = (ax, az, bx, bz) => {
+    const H = s.head, r2 = T.keepOutM * T.keepOutM, ex = bx - ax, ez = bz - az, l2 = ex * ex + ez * ez;
+    if ((ax - H.x) * (ax - H.x) + (az - H.z) * (az - H.z) < r2) return true; // already inside: any leg out is fine
+    let t = l2 > 1e-12 ? ((H.x - ax) * ex + (H.z - az) * ez) / l2 : 0; t = t < 0 ? 0 : t > 1 ? 1 : t;
+    const px = ax + ex * t - H.x, pz = az + ez * t - H.z; return px * px + pz * pz >= r2;
+  };
+  const rcPlanClear = (c, legs) => { let x = c.x, z = c.z; for (const l of legs) { if (!rcSegClear(x, z, l.x, l.z)) return false; x = l.x; z = l.z; } return true; };
+  // the most recent hand within curiousM (flat) seen in the last curiousAgeS: { x, z, d } or null
+  const rcNearHand = (c) => {
+    let best = null;
+    for (const k in s.hands) { const hd = s.hands[k]; if (s.tick - hd.tick > RC_T(T.curiousAgeS)) continue; const d = rcLen(hd.x - c.x, hd.z - c.z); if (d <= T.curiousM && (!best || d < best.d)) best = { x: hd.x, y: hd.y, z: hd.z, d }; }
+    return best;
+  };
 
   const think = (c) => {
     // nap time
@@ -419,7 +477,7 @@ export function createRoomSession(opts = {}) {
     const zoom = s.phase === 'wind';
     if (c.sulk > 0) { // wandering off: a far sample of its surface, walked, then a loaf; no play until the sulk ends
       const surf = roomSurface(room, c.surf); let far = null, fd = -1;
-      for (let i = 0; i < 6; i++) { const p = prng.pick(surf.samples); const d = rcLen(p.x - c.x, p.z - c.z); if (d > fd && roomLineLegal(room, c.surf, c, p)) { fd = d; far = p; } }
+      for (let i = 0; i < 6; i++) { const p = prng.pick(surf.samples); const d = rcLen(p.x - c.x, p.z - c.z); if (d > fd && rcClear(p.x, p.z) && rcSegClear(c.x, c.z, p.x, p.z) && roomLineLegal(room, c.surf, c, p)) { fd = d; far = p; } }
       if (far && fd > 0.3) { c.plan = [{ k: 'walk', x: far.x, z: far.z }]; c.goal = 'wander'; return; }
       c.mode = 'idle'; c.pose = 'loaf'; c.t = RC_T(1.5); return;
     }
@@ -440,8 +498,9 @@ export function createRoomSession(opts = {}) {
       if (c.surf === L.surf) {
         const d = rcLen(L.x - c.x, L.z - c.z);
         if (d <= T.pounceR && c.cool <= 0) { c.mode = 'tell'; c.pose = 'crouch'; c.tell = RC_T(T.tellS); c.tellKind = 'pounce'; c.tellX = L.x; c.tellZ = L.z; c.plan = []; rcFace(c, L.x - c.x, L.z - c.z); emit({ type: 'tell', cat: c.id, kind: 'pounce' }); return; }
-        c.goal = 'chase'; c.mode = 'run'; c.pose = 'run';
-        if (walkOrDetour(c, L.x, L.z, c.lim.run, 'chase') === null) { c.mode = 'idle'; c.pose = 'stare'; c.t = RC_T(0.25); }
+        const stalk = d <= T.stalkM; // inside stalkM the chase SLOWS to a stalk (low walk, eyes on the dot) before the crouch tell
+        c.goal = 'chase'; c.mode = stalk ? 'stalk' : 'run'; c.pose = stalk ? 'walk' : 'run';
+        if (walkOrDetour(c, L.x, L.z, stalk ? T.stalkV : c.lim.run, 'chase') === null) { c.mode = 'idle'; c.pose = 'stare'; c.t = RC_T(0.25); }
         return;
       }
       if (planTo(c, L.surf, L.x, L.z)) { c.goal = 'chase'; c.t = RC_T(0.6); return; }
@@ -462,18 +521,53 @@ export function createRoomSession(opts = {}) {
       if (c.surf === W.surf) { if (walkOrDetour(c, W.x, W.z, c.lim.walk, 'wander') === null) { c.mode = 'idle'; c.pose = 'stare'; c.t = RC_T(0.3); } else { c.mode = 'walk'; c.pose = 'walk'; } return; }
       if (planTo(c, W.surf, W.x, W.z)) return;
     }
-    // wander
-    const surf = roomSurface(room, c.surf), r = prng.next();
-    if (r < (zoom ? 0.75 : 0.45)) {
-      for (let i = 0; i < 4; i++) { const p = prng.pick(surf.samples); if (roomLineLegal(room, c.surf, c, p)) { c.plan = [{ k: 'walk', x: p.x, z: p.z }]; c.goal = zoom ? 'zoom' : 'wander'; return; } }
-    } else if (r < (zoom ? 0.95 : 0.8)) {
+    // wander = the idle CYCLE of a cat (see the header). Order: wake-up stretch, doze, curiosity toward a hand, home toward the
+    // player, a short walk + pause, a rare hop, else sit / loaf / groom.
+    const surf = roomSurface(room, c.surf);
+    if (c.wake) { c.wake = false; c.mode = 'idle'; c.pose = 'stretch'; c.t = RC_T(T.stretchS); return; }
+    if (!zoom && c.played > 0 && c.hearts === 0 && !s.laser && !s.treat && !s.wand && s.tick - s.lastHandTick > RC_T(T.dozeAfterS)) {
+      c.mode = 'idle'; c.pose = 'nap'; c.t = RC_T(prng.range(T.dozeS0, T.dozeS1)); return; // played out and nobody around: a doze (any hand wakes it)
+    }
+    const hand = zoom ? null : rcNearHand(c);
+    if (hand && prng.chance(T.curiousP)) {
+      const look = { k: 'pause', n: RC_T(prng.range(T.lookS0, T.lookS1)), pose: 'sit' };
+      // the stop: on the FAR side of the hand from the body (head -> hand direction, or head -> kitten when the hand is at the body),
+      // at least keepOutM out, curiousStopM past the hand: the kitten sits in front of the player, in view, never on the feet (CH M1)
+      const H = s.head; let ux = hand.x - H.x, uz = hand.z - H.z, dhb = rcLen(ux, uz);
+      if (dhb < 0.05) { ux = H.fx; uz = H.fz; } else { ux /= dhb; uz /= dhb; }
+      { ux += H.fx; uz += H.fz; const l = rcLen(ux, uz); if (l < 1e-6) { ux = H.fx; uz = H.fz; } else { ux /= l; uz /= l; } } // biased toward the player's forward: a hand at the hip puts the kitten 45 deg ahead, in view
+      const reach = Math.max(dhb + T.curiousStopM, T.keepOutM + 0.05), tx = H.x + ux * reach, tz = H.z + uz * reach;
+      const at = roomNearestLegal(room, { x: hand.x, y: hand.y, z: hand.z }), dt = rcLen(tx - c.x, tz - c.z);
+      if (dt > 0.12 && rcClear(tx, tz)) {
+        if (c.surf === at.surf || !at.surf) { // same surface as the spot under the hand: straight, or around the couch (detour), to the stop
+          if (legalAt(c, tx, tz) && roomLineLegal(room, c.surf, c, { x: tx, z: tz }) && rcSegClear(c.x, c.z, tx, tz)) { c.plan = [{ k: 'walk', x: tx, z: tz }, look]; c.goal = 'curious'; return; }
+          const w = legalAt(c, tx, tz) && c.curDetCd <= 0 ? detour(c, tx, tz) : null; if (c.curDetCd <= 0) c.curDetCd = RC_T(T.curiousDetourCdS); // (CH S1: one curiosity detour plan per kitten per curiousDetourCdS)
+          if (w) { const legs = rcLegs(w); if (rcPlanClear(c, legs)) { c.plan = legs.concat([look]); c.goal = 'curious'; return; } }
+        } else if (roomLegalAt(room, at.surf, tx, tz) && planTo(c, at.surf, tx, tz)) { if (rcPlanClear(c, c.plan)) { c.plan.push(look); c.goal = 'curious'; return; } c.plan = []; } // the hand is over another surface (the couch seat): hop over to it
+      }
+      if (rcClear(c.x, c.z)) { c.mode = 'idle'; c.pose = prng.chance(0.5) ? 'sit' : 'stand'; c.t = RC_T(prng.range(T.lookS0, T.lookS1)); rcFace(c, hand.x - c.x, hand.z - c.z); return; } // close enough (or no way there): sit and look at the hand
+    }
+    if (!zoom && rcLen(s.box.x - c.x, s.box.z - c.z) > T.homeM && prng.chance(T.homeP)) {
+      let best = null, bd = Infinity; // of 6 random samples of this surface, the one nearest the box spot with a legal line (a step home, not a teleport)
+      for (let i = 0; i < 6; i++) { const p = prng.pick(surf.samples); const d = rcLen(p.x - s.box.x, p.z - s.box.z); if (d < bd && d < rcLen(c.x - s.box.x, c.z - s.box.z) - 0.3 && rcLen(p.x - c.x, p.z - c.z) <= T.wanderMaxM * 1.5 && rcClear(p.x, p.z) && rcSegClear(c.x, c.z, p.x, p.z) && roomLineLegal(room, c.surf, c, p)) { bd = d; best = p; } }
+      if (best) { c.plan = [{ k: 'walk', x: best.x, z: best.z }, { k: 'pause', n: RC_T(prng.range(T.pauseS0, T.pauseS1)), pose: 'stand' }]; c.goal = 'wander'; return; }
+    }
+    const r = prng.next();
+    if (r < (zoom ? 0.75 : 0.4)) {
+      for (let i = 0; i < 6; i++) {
+        const p = prng.pick(surf.samples); if (!zoom && rcLen(p.x - c.x, p.z - c.z) > T.wanderMaxM) continue;
+        if (rcClear(p.x, p.z) && rcSegClear(c.x, c.z, p.x, p.z) && roomLineLegal(room, c.surf, c, p)) { c.plan = [{ k: 'walk', x: p.x, z: p.z }]; if (!zoom) c.plan.push({ k: 'pause', n: RC_T(prng.range(T.pauseS0, T.pauseS1)), pose: 'stand' }); c.goal = zoom ? 'zoom' : 'wander'; return; }
+      }
+    } else if (r < (zoom ? 0.95 : 0.4 + T.hopP)) {
       const hops = roomHops(room, c.surf, c.lim);
       if (hops.length) {
-        const e = prng.pick(hops), pair = e.pairs.find((p) => roomLineLegal(room, c.surf, c, p.a));
+        const e = prng.pick(hops), pair = e.pairs.find((p) => (zoom || rcLen(p.a.x - c.x, p.a.z - c.z) <= T.wanderMaxM * 1.5) && rcClear(p.a.x, p.a.z) && rcClear(p.b.x, p.b.z) && rcSegClear(c.x, c.z, p.a.x, p.a.z) && roomLineLegal(room, c.surf, c, p.a)); // (a hop whose run-up is near; a far one waits for a later think)
         if (pair) { c.plan = [{ k: 'walk', x: pair.a.x, z: pair.a.z }, { k: 'hop', to: e.to, x: pair.b.x, z: pair.b.z }]; c.goal = 'wander'; return; }
       }
     }
-    c.mode = 'idle'; c.pose = prng.chance(0.5) ? 'sit' : 'loaf'; c.t = RC_T(prng.range(1.2, 4));
+    const q = prng.next();
+    c.mode = 'idle'; c.pose = q < 0.35 ? 'sit' : q < 0.65 ? 'loaf' : q < 0.9 ? 'groom' : 'stretch';
+    c.t = RC_T(c.pose === 'stretch' ? T.stretchS : prng.range(T.idleS0, T.idleS1));
   };
 
   //: the highest legal surface above the cat's that it can reach in ONE hop (roomHops honours lim.up / gap), with
@@ -498,7 +592,7 @@ export function createRoomSession(opts = {}) {
     const L = s.laser, d = L && L.surf === c.surf ? rcLen(L.x - c.x, L.z - c.z) : Infinity;
     const moved = L ? rcLen(L.x - c.dotX0, L.z - c.dotZ0) : Infinity; // the dot's travel during the flight (from the launch): the escape
     if (d <= T.catchR && moved <= T.escapeM) {
-      emit({ type: 'pounce', cat: c.id, catch: true, d }); emit({ type: 'catch', cat: c.id, d });
+      emit({ type: 'pounce', cat: c.id, catch: true, d }); emit({ type: 'catch', cat: c.id, d }); c.played++;
       c.mode = 'pin'; c.pose = 'pin'; c.pin = RC_T(T.pinS); c.t = 0;
       if (s.comboCd <= 0 && rcCombo(s.combo, s.tick, T.comboN, RC_T(T.comboS))) { emit({ type: 'combo', n: T.comboN }); s.comboCd = RC_T(T.comboCdS); }
       return;
@@ -518,8 +612,14 @@ export function createRoomSession(opts = {}) {
     const L = s.laser;
     if (!L || L.surf !== c.surf || !c.interest) { c.pose = 'stare'; c.t = RC_T(0.2); return; }
     // aim = the dot now + its velocity over the tell x the flight (a lead); clamped to pounceReach; legal or no lead; legal or in place
-    const lead = T.pounceLeadS / T.tellS, trav = rcLen(L.x - c.tellX, L.z - c.tellZ), er = trav * T.aimErr * Math.sqrt(prng.next()), ea = prng.next() * 6.2831853;
-    let x = L.x + (L.x - c.tellX) * lead + er * Math.cos(ea), z = L.z + (L.z - c.tellZ) * lead + er * Math.sin(ea), d = rcLen(x - c.x, z - c.z);
+    // the dot's velocity over leadWinS (the ring; falls back to the tell when the ring has no dot on this surface that far back)
+    const k = (s.tick + 1) % s.laserHistN, oldOk = s.laserHS[k] === L.surf, win = oldOk ? (s.laserHistN - 1) * STEP_S : T.tellS; // the oldest slot = leadWinS ago
+    const ox = oldOk ? s.laserHX[k] : c.tellX, oz = oldOk ? s.laserHZ[k] : c.tellZ;
+    const vx = (L.x - ox) / win, vz = (L.z - oz) / win, trav = rcLen(vx, vz) * T.tellS, held = trav < T.leadDeadM;
+    const lead = held ? 0 : T.pounceLeadS, er = held ? 0 : trav * T.aimErr * Math.sqrt(prng.next()), ea = held ? 0 : prng.next() * 6.2831853; // (a held dot: no prng draw, aimed exactly)
+    let ax = L.x, az = L.z;
+    if (held) { let n = 0, sx = 0, sz = 0; for (let i = 0; i < T.heldMeanN; i++) { const q = (s.tick - i + s.laserHistN) % s.laserHistN; if (s.laserHS[q] !== L.surf) break; sx += s.laserHX[q]; sz += s.laserHZ[q]; n++; } if (n) { ax = sx / n; az = sz / n; } } // a held dot: aim at its recent MEAN (the jitter averages out; CK S1)
+    let x = ax + vx * lead + er * Math.cos(ea), z = az + vz * lead + er * Math.sin(ea), d = rcLen(x - c.x, z - c.z);
     if (d > T.pounceReach) { const k = T.pounceReach / d; x = c.x + (x - c.x) * k; z = c.z + (z - c.z) * k; }
     if (!legalAt(c, x, z)) { x = L.x; z = L.z; d = rcLen(x - c.x, z - c.z); if (d > T.pounceReach) { const k = T.pounceReach / d; x = c.x + (x - c.x) * k; z = c.z + (z - c.z) * k; } if (!legalAt(c, x, z)) { x = c.x; z = c.z; } }
     c.dotX0 = L.x; c.dotZ0 = L.z; startHop(c, c.surf, x, c.y, z, 0.12, 'pounce'); c.cool = RC_T(T.pounceCdS);
@@ -533,7 +633,7 @@ export function createRoomSession(opts = {}) {
   const handLost = (c) => { const hs = s.hands[c.hand]; return s.tick - Math.max(hs ? hs.tick : -1e9, c.onT) > RC_T(T.handLostS); };
   const stepCat = (c) => {
     if (c.cool > 0) c.cool--; if (c.petCd > 0) c.petCd--; if (c.purr > 0) c.purr--; if (c.mute > 0) c.mute--; if (c.leapCool > 0) c.leapCool--;
-    if (c.treatCd > 0) c.treatCd--; if (c.detourCd > 0) c.detourCd--; if (c.sulk > 0) c.sulk--; if (c.hearts > 0 && --c.heartT <= 0) { c.hearts--; c.heartT = RC_T(T.heartsDecayS); }
+    if (c.treatCd > 0) c.treatCd--; if (c.detourCd > 0) c.detourCd--; if (c.curDetCd > 0) c.curDetCd--; if (c.sulk > 0) c.sulk--; if (c.hearts > 0 && --c.heartT <= 0) { c.hearts--; c.heartT = RC_T(T.heartsDecayS); }
     if (c.mode === 'inbox') {
       c.y = s.box.y;
       if (s.phase !== 'drop' && s.box.open && s.openTick >= 0) {
@@ -563,7 +663,7 @@ export function createRoomSession(opts = {}) {
       c.x += (p.x - c.x) * k; c.y += (p.y - c.y) * k; c.z += (p.z - c.z) * k;
       if (Math.abs(p.x - c.x) + Math.abs(p.y - c.y) + Math.abs(p.z - c.z) < 1e-4) { c.x = p.x; c.y = p.y; c.z = p.z; }
       c.pose = c.eat > 0 ? 'eat' : 'sit';
-      if (c.eat > 0 && --c.eat === 0) { c.bond++; s.treat.eaten = true; c.treatCd = RC_T(T.treatCdS); emit({ type: 'eat', cat: c.id, hearts: hearts(c, 2) }); }
+      if (c.eat > 0 && --c.eat === 0) { c.bond++; c.played++; s.treat.eaten = true; c.treatCd = RC_T(T.treatCdS); emit({ type: 'eat', cat: c.id, hearts: hearts(c, 2) }); }
       return;
     }
     if (c.mode === 'hop') {
@@ -605,10 +705,15 @@ export function createRoomSession(opts = {}) {
     if (c.plan.length) {
       const leg = c.plan[0];
       if (leg.k === 'stare') { c.mode = 'idle'; c.pose = 'stare'; if (s.laser) rcFace(c, s.laser.x - c.x, s.laser.z - c.z); if (--leg.n <= 0) c.plan.shift(); return; }
+      if (leg.k === 'pause') { // the stand-and-look after a walk: faces the nearest recent hand (the player) when one is near
+        c.mode = 'idle'; c.pose = leg.pose || 'stand'; const hd = rcNearHand(c); if (hd) rcFace(c, hd.x - c.x, hd.z - c.z);
+        if (--leg.n <= 0) c.plan.shift(); return;
+      }
       if (leg.k === 'walk') {
         const fast = c.goal === 'chase' || c.goal === 'zoom';
-        const r = walk(c, leg.x, leg.z, fast ? c.lim.run : c.lim.walk);
-        c.mode = fast ? 'run' : 'walk'; c.pose = c.mode;
+        const stalk = c.goal === 'chase' && s.laser && c.surf === s.laser.surf && rcLen(s.laser.x - c.x, s.laser.z - c.z) <= T.stalkM;
+        const r = walk(c, leg.x, leg.z, stalk ? T.stalkV : fast ? c.lim.run : c.lim.walk);
+        c.mode = stalk ? 'stalk' : fast ? 'run' : 'walk'; c.pose = stalk ? 'walk' : c.mode;
         if (r === true) c.plan.shift(); else if (r === null) { const rest = c.plan.slice(1); c.plan = []; const w = c.detourCd > 0 ? null : detour(c, leg.x, leg.z); if (w) { c.detourCd = RC_T(T.detourCdS); c.plan = rcLegs(w).concat(rest); } else { c.mode = 'idle'; c.pose = 'sit'; c.t = RC_T(0.3); } }
         // laser moved: re-think a chase every 0.5 s
         if (c.goal === 'chase' && (s.tick - c.lastHop) % 30 === 0 && s.laser && c.surf === s.laser.surf && !(c.detourTo && rcLen(s.laser.x - c.detourTo.x, s.laser.z - c.detourTo.z) < 0.25)) { c.plan = []; c.detourTo = null; } // (a detour plan survives while the dot stays near its goal)
@@ -652,6 +757,7 @@ export function createRoomSession(opts = {}) {
       s.out.length = 0; const was = s.phase;
       if (s.queue.length) { for (const e of s.queue) { s.log.push({ tick: s.tick, ev: e }); apply(e); } s.queue = []; }
       phaseStep(); if (s.comboCd > 0) s.comboCd--;
+      { const k = s.tick % s.laserHistN; if (s.laser) { s.laserHS[k] = s.laser.surf; s.laserHX[k] = s.laser.x; s.laserHZ[k] = s.laser.z; } else s.laserHS[k] = null; }
       if (s.phase !== was) emit({ type: 'phase', phase: s.phase }); // a pinch / openBox opens the box in apply, hence here
       for (const c of s.cats) stepCat(c);
       s.tick++;
@@ -663,13 +769,14 @@ export function createRoomSession(opts = {}) {
     state() {
       return {
         tick: s.tick, phase: s.phase, box: { ...s.box }, laser: s.laser && { ...s.laser }, wand: s.wand && { ...s.wand.at, tip: s.wand.p }, treat: s.treat && { ...s.treat.p, cat: s.treat.cat },
-        cats: s.cats.map((c) => ({ id: c.id, size: c.size, x: c.x, y: c.y, z: c.z, fx: c.fx, fz: c.fz, surf: c.surf, mode: c.mode, pose: c.pose, poof: c.poof, purr: c.purr > 0, bond: c.bond, hearts: c.hearts, full: c.treatCd > 0, sulk: c.sulk > 0, airborne: c.mode === 'hop' || c.mode === 'fly', support: c.mode === 'carried' || c.mode === 'onhand' ? 'hand' : c.surf })),
+        cats: s.cats.map((c) => ({ id: c.id, size: c.size, x: c.x, y: c.y, z: c.z, fx: c.fx, fz: c.fz, surf: c.surf, mode: c.mode, pose: c.pose, poof: c.poof, purr: c.purr > 0, bond: c.bond, hearts: c.hearts, full: c.treatCd > 0, sulk: c.sulk > 0, doze: c.mode === 'idle' && c.pose === 'nap', airborne: c.mode === 'hop' || c.mode === 'fly', support: c.mode === 'carried' || c.mode === 'onhand' ? 'hand' : c.surf })),
       };
     },
     hash() {
       const h = createHasher(); h.num(s.tick).str(s.phase).num(prng.getState() / 65536);
       h.num(s.box.y).num(s.box.open ? 1 : 0);
-      for (const c of s.cats) h.str(c.id).str(c.mode).str(c.pose).str(c.surf || '-').num(c.x).num(c.y).num(c.z).num(c.fx).num(c.fz).num(c.bond).num(c.poof ? 1 : 0).num(c.cool).num(c.mute).num(c.leapCool).num(c.treatCd).num(c.hearts).num(c.sulk);
+      for (const c of s.cats) h.str(c.id).str(c.mode).str(c.pose).str(c.surf || '-').num(c.x).num(c.y).num(c.z).num(c.fx).num(c.fz).num(c.bond).num(c.poof ? 1 : 0).num(c.cool).num(c.mute).num(c.leapCool).num(c.treatCd).num(c.hearts).num(c.sulk).num(c.played);
+      h.num(s.head.x).num(s.head.z).num(s.head.fx).num(s.head.fz);
       return h.digest();
     },
   };

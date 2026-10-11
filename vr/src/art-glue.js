@@ -44,3 +44,48 @@ export function createResidency(budget = 8 * 1024 * 1024, staleS = 1.0, loReserv
   };
   return api;
 }
+
+/** Sheet orientation for GPU upload (Quest fix 2026-10-10, the owner's "flashing parts in a rectangle"): WebGL IGNORES
+ *  UNPACK_FLIP_Y_WEBGL (three's texture.flipY) for an ImageBitmap source, so a sheet decoded with createImageBitmap landed
+ *  in the GPU with row 0 at v = 0 while atlas.js UVs assume three's flipY convention (image top at v = 1): every frame sampled
+ *  the vertically MIRRORED rect = a rectangle of neighbouring frames' parts, changing every anim frame. The bitmap must be made
+ *  with imageOrientation 'flipY' and its Texture gets flipY = false (both browsers that honour and ignore the pixelStorei then
+ *  agree). An <img> source keeps flipY = true. `kind` = 'bitmap' | 'img'. */
+export function sheetTextureOrientation(kind) {
+  return kind === 'bitmap' ? { flipY: false, bitmapOptions: { colorSpaceConversion: 'none', premultiplyAlpha: 'none', imageOrientation: 'flipY' } } : { flipY: true, bitmapOptions: null };
+}
+/** 1 x 2 probe for the flip: `topBefore` / `topAfter` = the alpha-or-red of the TOP pixel before and after a createImageBitmap
+ *  with imageOrientation 'flipY' was drawn back to a canvas. true = the browser really flipped (safe to use bitmaps). */
+export function bitmapFlipWorked(topBefore, bottomBefore, topAfter) {
+  return topBefore !== bottomBefore && topAfter === bottomBefore;
+}
+/** LOD with hysteresis (no hi <-> lo re-upload every 500 ms for a kitten sitting at the 2.5 m line): hi within hiM, lo beyond
+ *  hiM + bandM; in between the previous lod stays. */
+export function pickLodStable(distM, prev, hiM = 2.5, bandM = 0.3) {
+  const d = Number(distM);
+  if (!(d >= 0)) return prev || 'hi';
+  if (d <= hiM) return 'hi';
+  if (d > hiM + bandM) return 'lo';
+  return prev === 'lo' ? 'lo' : prev === 'hi' ? 'hi' : d <= hiM ? 'hi' : 'lo';
+}
+/** DEV smoke / CI: is the cell a billboard reports (room-hook artState) a REAL frame of the manifest? cell = { cat, view, anim,
+ *  index, sheet, lod, rect: [x, y, w, h] (sheet px of its lod), uv: { u0, v0, u1, v1 }, flipX, flipY, kind }. Returns [] when
+ *  valid, else the reasons. */
+export function checkArtCell(cell, manifest) {
+  const out = [], M = manifest;
+  if (!cell || !M || !M.cats[cell.cat]) return ['unknown cat ' + (cell && cell.cat)];
+  const C = M.cats[cell.cat], list = C.frames[cell.view] && C.frames[cell.view][cell.anim];
+  if (!list) return [`no frames for ${cell.cat} ${cell.view} ${cell.anim}`];
+  const fr = list[cell.index]; if (!fr) return [`frame index ${cell.index} of ${list.length}`];
+  const s = cell.lod === 'lo' ? 0.5 : 1, want = fr.hi.r.map((q) => q * s), L = C.atlas[cell.lod === 'lo' ? 'lo' : 'hi'];
+  if (fr.hi.s !== cell.sheet) out.push(`sheet ${cell.sheet} != ${fr.hi.s}`);
+  if (!cell.rect || cell.rect.some((q, i) => Math.abs(q - want[i]) > 1e-6)) out.push(`rect ${JSON.stringify(cell.rect)} != ${JSON.stringify(want)}`);
+  const [x, y, w, h] = want, u = cell.uv || {}, eps = 1e-6;
+  const uA = cell.flipX ? u.u1 : u.u0, uB = cell.flipX ? u.u0 : u.u1;
+  if (Math.abs(uA - x / L.w) > eps || Math.abs(uB - (x + w) / L.w) > eps) out.push('u range off');
+  if (Math.abs(u.v1 - (1 - y / L.h)) > eps || Math.abs(u.v0 - (1 - (y + h) / L.h)) > eps) out.push('v range off (atlas UVs are flipY-true: image top at v = 1)');
+  if (!(u.v0 < u.v1)) out.push('v0 >= v1');
+  if (cell.kind === 'bitmap' && cell.flipY !== false) out.push('ImageBitmap sheet with texture.flipY true: WebGL ignores it, the sheet uploads unflipped (mirrored cells)');
+  if (cell.kind === 'img' && cell.flipY !== true) out.push('<img> sheet needs texture.flipY true for these UVs');
+  return out;
+}

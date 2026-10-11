@@ -25,7 +25,8 @@ import { boxAnim, FX_TUNING } from './fx.js';
 import { catArtDraw } from './cat-art.js';
 // P0a: Design's VR1 sprites (vr/public/art, loader vr/src/art/atlas.js) through the bundled slim manifest (no fetch; the
 // PNG atlases are build files loaded by three's TextureLoader). hi for the 3 nearest kittens, lo for the rest (pickLod).
-import { createAtlas, pickLod } from './art/atlas.js';
+import { createAtlas } from './art/atlas.js';
+import { sheetTextureOrientation, bitmapFlipWorked, pickLodStable, checkArtCell } from './art-glue.js';
 import { ART_MANIFEST } from './art-manifest.gen.js';
 import { artIdOf, artPose, boxFaceUV, createResidency } from './art-glue.js';
 import { LT_ROOM_STARTERS } from '../../game/core/lasertag-room.js';
@@ -104,15 +105,32 @@ export function createRoomHook(opts = {}) {
   const pinned = new Set(); // sheets uploaded by warm() before their first draw: kept through the stale sweep until drawn once (the budget still counts them)
   const sheetBytes = (file) => (/\.lo\.png$/.test(file) ? M.lods.lo.gpuBytesPerCat : M.lods.hi.gpuBytesPerCat);
   const imgLoader = typeof document !== 'undefined' ? new ImageLoader() : null;
+  // Quest fix (2026-10-10, the owner's "flashing parts in a rectangle"): WebGL ignores texture.flipY for an ImageBitmap source, so a
+  // sheet must be decoded with imageOrientation 'flipY' and uploaded with flipY = false (art-glue sheetTextureOrientation). A
+  // 1 x 2 probe checks the browser really flips the bitmap; if not, sheets stay <img> (flipY true, honoured for <img>).
+  const bitmapOk = (typeof createImageBitmap === 'function' && typeof document !== 'undefined') ? new Promise((res) => {
+    try {
+      const c = document.createElement('canvas'); c.width = 1; c.height = 2; const g = c.getContext('2d');
+      g.fillStyle = 'rgba(255,0,0,1)'; g.fillRect(0, 0, 1, 1); g.fillStyle = 'rgba(0,0,255,1)'; g.fillRect(0, 1, 1, 1);
+      const before = g.getImageData(0, 0, 1, 2).data, topB = before[0], botB = before[4];
+      createImageBitmap(c, sheetTextureOrientation('bitmap').bitmapOptions).then((bmp) => {
+        const d = document.createElement('canvas'); d.width = 1; d.height = 2; const h = d.getContext('2d'); h.drawImage(bmp, 0, 0);
+        const after = h.getImageData(0, 0, 1, 2).data; if (typeof bmp.close === 'function') bmp.close();
+        res(bitmapFlipWorked(topB, botB, after[0]));
+      }, () => res(false));
+    } catch (e) { res(false); }
+  }) : Promise.resolve(false);
+  let bitmapMode = null; bitmapOk.then((ok) => { bitmapMode = ok; if (onPerf) onPerf('bitmap-probe', { flipOk: ok }); });
+  const imageKind = (img) => (typeof ImageBitmap !== 'undefined' && img instanceof ImageBitmap ? 'bitmap' : 'img');
   function preloadImage(file) {
     if (!imgLoader || images.has(file)) return;
     images.set(file, 'loading');
-    // decode upfront into an ImageBitmap when the browser has it (its pixels stay decoded; an <img> may drop them under memory
-    // pressure and decode again at upload time: review BF S2b), else a decoded <img>
+    // decode upfront into an ImageBitmap when the browser has it AND flips it on creation (its pixels stay decoded; an <img> may
+    // drop them under memory pressure and decode again at upload time: review BF S2b), else a decoded <img>
     imgLoader.load(ART_BASE + file, (img) => {
       const keep = (bmp) => images.set(file, bmp);
-      if (typeof createImageBitmap === 'function') createImageBitmap(img, { colorSpaceConversion: 'none', premultiplyAlpha: 'none' }).then(keep, () => { if (img && typeof img.decode === 'function') img.decode().then(() => keep(img), () => keep(img)); else keep(img); });
-      else if (img && typeof img.decode === 'function') img.decode().then(() => keep(img), () => keep(img)); else keep(img);
+      const asImg = () => { if (img && typeof img.decode === 'function') img.decode().then(() => keep(img), () => keep(img)); else keep(img); };
+      bitmapOk.then((ok) => { if (ok) createImageBitmap(img, sheetTextureOrientation('bitmap').bitmapOptions).then(keep, asImg); else asImg(); });
     }, undefined, () => images.delete(file));
   }
   const todayIds = (opts.cats || []).map((c) => artIdOf(c && c.id != null ? c.id : c)).filter((id) => atlas && atlas.resolveCat(id));
@@ -129,7 +147,7 @@ export function createRoomHook(opts = {}) {
     if (evicted === null) return null; // no room: the frame's upload slot stays free for this kitten's lo sheet (review BI S2)
     uploadsThisFrame++; uploads++;
     for (const f of evicted) freeTexture(f, true);
-    t = new Texture(img); t.colorSpace = SRGBColorSpace; t.generateMipmaps = false; t.minFilter = LinearFilter; t.magFilter = LinearFilter; t.needsUpdate = true;
+    t = new Texture(img); t.flipY = sheetTextureOrientation(imageKind(img)).flipY; t.colorSpace = SRGBColorSpace; t.generateMipmaps = false; t.minFilter = LinearFilter; t.magFilter = LinearFilter; t.needsUpdate = true;
     const t0 = onPerf ? now() : 0;
     if (opts.renderer && typeof opts.renderer.initTexture === 'function') { try { opts.renderer.initTexture(t); } catch (e) { /* upload at first draw */ } }
     if (onPerf) onPerf('upload', { file, bytes: sheetBytes(file), ms: +(now() - t0).toFixed(2), evicted: evicted.length, resident: residency.bytes });
@@ -352,7 +370,7 @@ export function createRoomHook(opts = {}) {
         const dt = (tNow - a.t) / 1000; if (dt > 0.001) { const dx = c.x - a.x, dz = c.z - a.z; a.speed += (Math.sqrt(dx * dx + dz * dz) / dt - a.speed) * 0.3; a.x = c.x; a.z = c.z; a.t = tNow; }
         const key = c.sprite + '|' + pose; if (key !== a.key) { a.key = key; a.since = tNow; }
         // LOD by distance only (Design 11:2x): hi within 2.5 m, lo beyond
-        if (head && tNow - lodT > 500) { a.lod = pickLod(Math.sqrt((head.x - c.x) ** 2 + (head.z - c.z) ** 2), result.cats.length); }
+        if (head && tNow - lodT > 500) { a.lod = pickLodStable(Math.sqrt((head.x - c.x) ** 2 + (head.z - c.z) ** 2), a.lod); } // hysteresis: no hi <-> lo churn at the 2.5 m line
         // cat-views decides the sprite sheet (side / front / back / above / below) + the mirror (flipX = the heading points to the
         // camera's left) + rotDeg for the top view; the atlas only supplies the frame (side art faces right, top art head +x)
         f = atlas.getFrame(aid, c.sprite, pose, (tNow - a.since) / 1000, { lod: a.lod, speedMps: a.speed, flipX: !!c.flipX });
@@ -362,7 +380,7 @@ export function createRoomHook(opts = {}) {
         const g = atlas.getFrame(aid, c.sprite, pose, (tNow - anim.get(c.id).since) / 1000, { lod: f.lod === 'hi' ? 'lo' : 'hi', speedMps: anim.get(c.id).speed, flipX: !!c.flipX });
         const gt = g ? drawTexture(g.file, t) : null; if (gt) { f = g; ftex = gt; }
       }
-      if (f && ftex) b.setAtlasFrame(f, ftex);
+      if (f && ftex) { b.setAtlasFrame(f, ftex); const a = anim.get(c.id); if (a) a.shown = { cat: f.cat, view: f.view, anim: f.anim, index: f.index, count: f.count, sheet: f.sheet, lod: f.lod, file: f.file, rect: f.rect, uv: f.uv, flipX: f.flipX, flipY: ftex.flipY, kind: imageKind(ftex.image), sprite: c.sprite, pose }; }
       else if (!(f && b.atlasMode && b.holdFrame(t))) b.setAtlasFrame(null); // perf: a kitten already in atlas art keeps its LAST frame (<= 0.25 s) while the new sheet uploads, instead of a one-frame canvas placeholder (a 256 px canvas draw + upload mid-play, then back)
       b.update(tNow); // W3: per-sprite texture + crossfade (canvas sprites only)
       if (c.shadow) b.setShadow(c.shadow.y, c.shadow.alpha); else b.setShadow(null, 0);
@@ -454,5 +472,7 @@ export function createRoomHook(opts = {}) {
     bridge.dispose();
   }
 
-  return { bridge, group, sync, warm, cats, dispose, get disposed() { return disposed; }, get residency() { return { bytes: residency.bytes, files: residency.files, images: images.size, uploads, pinned: pinned.size, warmSteps }; } };
+  /** DEV smoke: the atlas cell every kitten showed last (+ checkArtCell problems), for CI to assert a real frame is on the quad */
+  function artState() { const out = []; for (const [id, a] of anim) if (a.shown) out.push(Object.assign({ id, problems: M ? checkArtCell(a.shown, M) : [] }, a.shown)); return { bitmapMode, cells: out }; }
+  return { bridge, group, sync, warm, cats, dispose, artState, get disposed() { return disposed; }, get residency() { return { bytes: residency.bytes, files: residency.files, images: images.size, uploads, pinned: pinned.size, warmSteps }; } };
 }

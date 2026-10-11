@@ -170,6 +170,7 @@ class RoomCatSystem extends createSystem({
         sound: () => ({ enabled: sound.enabled, played: sound.played, dropped: sound.dropped }),
         cats: () => { const b = bridge(); return b && b.state ? b.state.cats.map(({ id, x, y, z, surf, mode, pose }) => ({ id, x, y, z, surf, mode, pose })) : []; },
         perf: () => perf.snapshot(), // sim vs render split, renderer.info, slowest frames with their events
+        art: () => { const h = this.life && this.life.hook; return h && typeof h.artState === 'function' ? h.artState() : null; }, // per-kitten atlas cell shown { view, anim, index, sheet, lod, rect, uv, flipY, kind, problems } (CI: a REAL frame is on the quad)
       };
       window.__kcaPerfEvent = (what, d) => perf.event(what, d);
     }
