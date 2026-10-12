@@ -33,6 +33,7 @@ import { LT_ROOM_STARTERS } from '../../game/core/lasertag-room.js';
 import { HAPPY_TUNING } from './director.js';
 import { Matrix4, Line, LineBasicMaterial, BufferGeometry, Float32BufferAttribute } from 'three';
 import { HUD_TUNING, hudLayout } from './hud-menu.js';
+import { TIP_TUNING } from './hints.js'; // GE2-B (Owner #2): the hint card is small, low + to the side, fades, any tap dismisses it
 import { DataTexture, ImageLoader, LinearFilter, RGBAFormat, Texture, UnsignedByteType } from 'three';
 
 const BOX_SIZE_M = 0.28; // roomcat: boxR 0.14, boxH 0.3
@@ -183,8 +184,8 @@ export function createRoomHook(opts = {}) {
   stick.visible = false; group.add(stick);
   const feather = new Mesh(new CircleGeometry(0.035, 12), new MeshBasicMaterial({ color: 0xff9ec7, side: DoubleSide, transparent: true, opacity: 0.95 }));
   feather.visible = false; group.add(feather);
-  // head-locked cards: hint / caption (small, below the gaze) and the end card (bigger, centred)
-  const card = makeCard(CARD_W, CARD_H, 512); group.add(card.mesh);
+  // cards: hint / caption (GE2-B: small, low and to the side, placed + faded by tip-card.js via result.tipCard) and the end card (bigger, centred)
+  const card = makeCard(TIP_TUNING.w, TIP_TUNING.h, 512); group.add(card.mesh);
   const endCard = makeCard(END_W, END_H, 768); group.add(endCard.mesh);
   let cardLines = '';
 
@@ -434,7 +435,9 @@ export function createRoomHook(opts = {}) {
     // Kitten Happiness meter (Play beats only; hidden during Laser Tag and the score card)
     if (dir && head && (dir.mode === 'play' || dir.mode === 'offer' || dir.mode === 'celebrate')) {
       meter.visible = true;
-      placeCard(meter, head, gaze, CARD_AHEAD, CARD_BELOW - METER_ABOVE);
+      const tcv = result.tipCard; // GE2-B: the meter rides above the tip card's spot (low + to the side), out of the kittens' way
+      if (tcv && tcv.placed) { meter.position.set(tcv.x, tcv.y + TIP_TUNING.h / 2 + 0.045, tcv.z); meter.rotation.set(0, tcv.yaw, 0); meter.scale.setScalar(0.8); }
+      else placeCard(meter, head, gaze, CARD_AHEAD, CARD_BELOW - METER_ABOVE);
       if (dir.meter !== meterShown) { meterShown = dir.meter; fill.scale.x = Math.max(0.0001, dir.meter); fill.material.color.setHex(dir.meterFull ? 0xffe08a : 0xff9ec7); }
     } else meter.visible = false;
     // SK-HUD: quick-stat strip + action tiles + ray cursors (hud-menu.js visual via bridge.frame's result.hud)
@@ -523,7 +526,11 @@ export function createRoomHook(opts = {}) {
       if (result.caption) lines.push(result.caption);
       const key = lines.join('\n');
       if (key !== cardLines) { cardLines = key; card.draw(lines, false); card.mesh.visible = lines.length > 0; if (onPerf) onPerf('card', { which: 'hint', lines: lines.length }); }
-      if (card.mesh.visible) placeCard(card.mesh, head, gaze, CARD_AHEAD, CARD_BELOW);
+      const tc = result.tipCard;
+      if (tc) { // GE2-B (Owner #2): world-locked with a lazy follow, auto-fade, tap to dismiss, hidden while the menu is open
+        card.mesh.visible = tc.show && lines.length > 0;
+        if (card.mesh.visible) { card.mesh.position.set(tc.x, tc.y, tc.z); card.mesh.rotation.set(0, tc.yaw, 0); card.mesh.material.opacity = tc.alpha; }
+      } else if (card.mesh.visible) placeCard(card.mesh, head, gaze, CARD_AHEAD, CARD_BELOW);
     }
   }
 

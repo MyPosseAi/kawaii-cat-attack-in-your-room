@@ -20,7 +20,7 @@
    higher than ROOM_LIMITS.maxPerchH). Each legal surface keeps a legality footprint (polygon minus obstacle footprints,
    inset by catR), sample points on a 0.15 m grid, spread-out spots (floor / perch / nap) and hop links (`edges`) to
    other surfaces with their height change and gap, so roomcat.js can check jump limits per cat size.
-   No scan / no floor plane: a 2 x 2 m virtual RUG on floorY in front of the viewer becomes the floor (rug: true), so
+   No scan / no floor plane: a 2.8 x 2.8 m virtual RUG (ROOM_LIMITS.rugSize) on floorY in front of the viewer becomes the floor (rug: true), so
    the experience never dead-ends in a room we never tested.
    Build rule: only `export function` / `export const`; private names carry the `rm` prefix (build-proto inlines every
    core module into one classic script). */
@@ -36,7 +36,9 @@ export const ROOM_LIMITS = Object.freeze({
   maxDrop: 1.4,        // largest downward hop
   maxGap: 1.2,         // largest horizontal hop distance (adult)
   grid: 0.15, gridBig: 0.2, bigArea: 6, spotGap: 0.3, edgePairs: 6, edgePairGap: 0.3,
-  rugSize: 2, rugAhead: 1.0, boxAhead: 0.6,
+  // GE1-B 2026-10-11 (the owner's Quest test: "play zone is small"): the no-scan rug grows 2 x 2 -> 2.8 x 2.8 m (2x the area), its near
+  // edge still at the viewer's feet (rugAhead = rugSize / 2); the box stays boxAhead ahead. A scanned floor is the real floor plane.
+  rugSize: 2.8, rugAhead: 1.4, boxAhead: 0.6,
 });
 /** nap preference (lower = better): couch seat, then bed, then floor / rug (plan 1.3) */
 export const ROOM_NAP_RANK = Object.freeze({ seat: 0, bed: 1, floor: 2, rug: 2 });

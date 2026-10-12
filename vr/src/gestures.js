@@ -17,12 +17,12 @@
                                                    view cone and above the posture-aware lap line (W2 review SHOULD 1: a hand
                                                    resting palm-up on the lap is not a treat; a standing player reaching down
                                                    to a floor cat is), and ends when the palm drops to the lap
-     { type: 'pet_start' | 'pet_hold' | 'pet_end', hand, p, target, v }       open hand moving slowly (petVMin..petVMax)
-                                                   within petNear of a target point, palm facing it, for petHoldS
+     { type: 'pet_start' | 'pet_hold' | 'pet_end', hand, p, target, q, v }    a relaxed hand (petFingers open, not palm-up)
+                                                   in the PET REACH of a target (petDist), petHoldS; q = that target point
      { type: 'lost', hand }                         tracking lost (every active gesture ends first: a pinch releases at v = 0)
    Hysteresis everywhere (on / off thresholds + grace times), ONE gesture active per hand (pinch > point > palm > pet). */
 
-export const GESTURES_VERSION = 5; // 2: straightness from the knuckle, palm normal from the knuckles, view / lap gate
+export const GESTURES_VERSION = 6; // 6 (GE2-B, the owner's Quest test 2026-10-11 "petting has not really worked at all"): see PET REACH below // 2: straightness from the knuckle, palm normal from the knuckles, view / lap gate
                                    // 3: posture-aware lap line (seated / standing), softer open-palm straightness (W3)
                                    // 4: posture hysteresis (standOnM / seatedOnM), seatedMaxM 1.4 (Code Review B 07:2x)
                                    // 5 (GDXE / GE1, owner's Quest test 2026-10-10): pinchOn 2.0 cm / pinchOff 3.5 cm (joint CENTRES of touching
@@ -70,7 +70,14 @@ export const GESTURE_TUNING = Object.freeze({
   // player (head 1.35: tall adult, high stool) seated, so a palm on the lap stays a resting hand. A 13-year-old standing
   // at eye height 1.28 is classed seated: a reach-down to the floor gives no treat (seated-first; noted for QA).
   viewConeDeg: 45, lapBelowM: 0.45, lapSlackM: 0.1, seatedMaxM: 1.4, standOnM: 1.45, seatedOnM: 1.25, standBelowM: 0.8, standMinM: 0.7,
-  petVMin: 0.0, petVMax: 0.4, petNear: 0.25, petFar: 0.35, petFace: 0.2, petHoldS: 0.4, petGraceS: 0.2, petCloseM: 0.08,
+  petVMin: 0.0, petVMax: 1.2, petNear: 0.25, petFar: 0.35, petFace: -2, petHoldS: 0.1, petGraceS: 0.3, petCloseM: 0.08,
+  petAboveM: 0.25, petFingers: 2, petExtOn: 0.55, petExtOff: 0.45,
+  // PET REACH (v6, GE2-B root cause): a kitten's back is 0.14 m over the floor, so the old 25 cm sphere around it needed a
+  // STANDING player's palm at 0.39 m or lower (a full crouch) AND the palm facing the back AND 3 straight fingers, then 0.4 s:
+  // on the Quest it almost never started. Now the reach is a column: the palm OR the index tip within petNear sideways, and up
+  // to petAboveM higher than that over her back (a hand held over a floor kitten at ~0.6 m pets; bending a little is enough);
+  // no facing test (petFace -2), 2 relaxed fingers (petExtOn 0.55), start after 0.1 s, any stroke speed up to 1.2 m/s.
+  // The event carries q = the target point, and the bridge sends THAT to roomcat, so every accepted pet lands (petR 0.25).
   // GO1 fix round (owner Quest test 03:55 "petting doesn't work"): petVMin 0.05 -> 0 (a hand resting on / slowly patting a kitten pauses; any
   // pause under 5 cm/s reset the 0.4 s start clock and a still hand ended the pet), and within petCloseM (8 cm) of the back the
   // palm-facing test is waived (a hand beside / level with a 14 cm-high kitten back faced sideways and never counted)
@@ -151,6 +158,26 @@ export function nearestTarget(p, targets, far) {
   if (!Array.isArray(targets)) return -1;
   for (let i = 0; i < targets.length; i++) { const q = targets[i]; if (!gOk(q)) continue; const d = gDist(p, q); if (d <= bd) { bd = d; best = i; } }
   return best;
+}
+
+/** PET REACH distance from a hand point p to a target (a kitten's back): the horizontal gap and the height ABOVE the back
+ *  minus petAboveM (a hand over her counts from higher up; below the back counts as is). */
+export function petDist(p, q, T) {
+  const Tn = T || GESTURE_TUNING, dx = p.x - q.x, dz = p.z - q.z;
+  let dy = p.y - q.y; const up = Number.isFinite(Tn.petAboveM) ? Tn.petAboveM : 0;
+  if (dy > 0) dy = Math.max(0, dy - up);
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+/** The target in PET REACH of the palm or the index tip: { i, d } (i -1 when none within `far`). */
+export function petTarget(palm, tip, targets, far, T) {
+  let best = -1, bd = far;
+  if (!Array.isArray(targets)) return { i: -1, d: Infinity };
+  for (let i = 0; i < targets.length; i++) {
+    const q = targets[i]; if (!gOk(q)) continue;
+    let d = petDist(palm, q, T); if (tip && gOk(tip)) { const d2 = petDist(tip, q, T); if (d2 < d) d = d2; }
+    if (d <= bd) { bd = d; best = i; }
+  }
+  return { i: best, d: bd };
 }
 
 /** The lap line (world y): a palm below it is resting, not offered. view = { head, floorY?, posture? }. Seated (head.y -
@@ -289,21 +316,23 @@ export function gestureStep(prev, sample, targets, tuning, view) {
   }
   if (st.palm) return { state: st, events, features: feat };
 
-  // ---- pet: open hand, slow stroke near a target, palm facing it
-  const facing = (i) => { const q = targets[i]; if (gDist(feat.palm, q) <= T.petCloseM) return true; const d = gNorm(gSub(q, feat.palm)); return gDot(d, feat.normal) >= T.petFace; };
+  // ---- pet: a relaxed hand (not palm-up) in PET REACH of a kitten (v6: no facing test, a column over her back, 0.1 s)
+  const petOpen = (on) => ['index', 'middle', 'ring', 'pinky'].reduce((n, f) => n + ((on ? ext[f] >= T.petExtOn : ext[f] > T.petExtOff) ? 1 : 0), 0) >= (T.petFingers || T.palmFingers);
+  const facing = (i) => { if (!(T.petFace > -1)) return true; const q = targets[i]; if (gDist(feat.palm, q) <= T.petCloseM) return true; const d = gNorm(gSub(q, feat.palm)); return gDot(d, feat.normal) >= T.petFace; };
+  const reach = (i) => { const q = targets[i]; let d = petDist(feat.palm, q, T); const d2 = petDist(feat.indexTip, q, T); return d2 < d ? d2 : d; };
   if (st.pet) {
     let i = st.petTarget;
-    if (!(i >= 0 && targets && gOk(targets[i]) && gDist(feat.palm, targets[i]) <= T.petFar)) i = nearestTarget(feat.palm, targets, T.petFar);
-    const keep = i >= 0 && openCount(false) >= T.palmFingers && speed >= T.petVMin * 0.5 && speed <= T.petVMax * 1.25 && facing(i);
+    if (!(i >= 0 && targets && gOk(targets[i]) && reach(i) <= T.petFar)) i = petTarget(feat.palm, feat.indexTip, targets, T.petFar, T).i;
+    const keep = i >= 0 && petOpen(false) && speed >= T.petVMin * 0.5 && speed <= T.petVMax * 1.25 && facing(i);
     if (keep) { st.petLost = null; st.petTarget = i; } else if (st.petLost == null) st.petLost = t;
     if (st.petLost != null && t - st.petLost >= T.petGraceS) { st.pet = false; st.petLost = null; st.petSince = null; events.push({ type: 'pet_end', hand, target: st.petTarget }); st.petTarget = -1; }
-    else events.push({ type: 'pet_hold', hand, p: feat.palm, target: st.petTarget, v });
+    else events.push({ type: 'pet_hold', hand, p: feat.palm, target: st.petTarget, q: targets[st.petTarget] || null, v });
   } else {
-    const i = nearestTarget(feat.palm, targets, T.petNear);
-    const shape = i >= 0 && openCount(true) >= T.palmFingers && speed >= T.petVMin && speed <= T.petVMax && feat.normal.y < 0.5 && facing(i); // palm up = the treat, never a pet
+    const i = petTarget(feat.palm, feat.indexTip, targets, T.petNear, T).i;
+    const shape = i >= 0 && petOpen(true) && !pointShape(true) && speed >= T.petVMin && speed <= T.petVMax && feat.normal.y < 0.5 && facing(i); // palm up = the treat, a point = the laser: never a pet
     if (shape) {
       if (st.petSince == null) st.petSince = t;
-      if (t - st.petSince >= T.petHoldS) { st.pet = true; st.petLost = null; st.petTarget = i; events.push({ type: 'pet_start', hand, p: feat.palm, target: i, v }); }
+      if (t - st.petSince >= T.petHoldS) { st.pet = true; st.petLost = null; st.petTarget = i; events.push({ type: 'pet_start', hand, p: feat.palm, target: i, q: targets[i], v }); }
     } else st.petSince = null;
   }
   return { state: st, events, features: feat };

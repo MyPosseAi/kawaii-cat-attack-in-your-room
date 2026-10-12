@@ -19,9 +19,9 @@
 export const HAPPY_VERSION = 1;
 export const HAPPY = Object.freeze({
   full: 100,
-  gain: Object.freeze({ stroke: 0.8, treat: 8.5, catch: 3.0, near_miss: 1.2, pounce: 0.6, toss: 6.5, play: 1.3, combo: 4.5 }), // GDXE 2026-10-10 (owner's Quest test): treat 7.5 -> 8.5 (Build 2 item 5: a real player is 1.3x slower than the bot). P0a Build 1 (GDXE fix 2): stroke 0.65 -> 0.8, toss 5.5 -> 6.5; + catch 3.5 / near_miss 1.6 (fix 1 turned catches into near misses)
+  gain: Object.freeze({ stroke: 0.8, treat: 8.5, catch: 5.5, near_miss: 2.4, pounce: 1.8, toss: 6.5, play: 1.3, combo: 4.5 }), // GE1-B 2026-10-11 (laser catches are EARNED now, roomcat hesitate / stale / fumble): catch 3.0 -> 5.5, near_miss 1.2 -> 2.4, pounce 0.6 -> 1.8 (+ caps below) keep the normal-play fill at p50 ~114 s (bot: pounces 57 -> 33 / 200 s, near misses 35 -> 11, catches 7 -> 2). // GDXE 2026-10-10 (owner's Quest test): treat 7.5 -> 8.5 (Build 2 item 5: a real player is 1.3x slower than the bot). P0a Build 1 (GDXE fix 2): stroke 0.65 -> 0.8, toss 5.5 -> 6.5; + catch 3.5 / near_miss 1.6 (fix 1 turned catches into near misses)
   // per-source cap in units per second (token bucket; the bucket holds max(1.5 gains, burstS seconds of the cap))
-  capPerS: Object.freeze({ stroke: 1.0, treat: 0.55, catch: 0.35, near_miss: 0.35, pounce: 0.22, toss: 0.55, play: 0.38, combo: 0.33 }),
+  capPerS: Object.freeze({ stroke: 1.0, treat: 0.55, catch: 0.5, near_miss: 0.55, pounce: 0.55, toss: 0.55, play: 0.38, combo: 0.33 }), // GE1-B: catch 0.35 -> 0.5, near_miss 0.35 -> 0.55, pounce 0.22 -> 0.55
   burstS: 4,              // a bucket holds this many seconds of its cap (2 catches in a row pay in full, then it throttles)
   idleS: 6,               // no source for this long -> decay starts
   decayPerS: 0.35,        // ... and the meter leaks this per second (a 100 meter takes ~5 min to empty: never punishing)

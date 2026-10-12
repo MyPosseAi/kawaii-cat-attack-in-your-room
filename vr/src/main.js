@@ -228,6 +228,10 @@ class RoomCatSystem extends createSystem({
       const sel = this.hudSel = new WeakMap();
       session.addEventListener('selectstart', (e) => sel.set(e.inputSource, true));
       session.addEventListener('selectend', (e) => sel.set(e.inputSource, false));
+      // GE2-B: the controller grip (squeeze): near a kitten it picks her up (she sits on the controller), elsewhere it pets the kitten on the ray
+      const sq = this.hudSq = new WeakMap();
+      session.addEventListener('squeezestart', (e) => sq.set(e.inputSource, true));
+      session.addEventListener('squeezeend', (e) => sq.set(e.inputSource, false));
     }
     if (fresh && DEV && typeof session.addEventListener === 'function') {
       session.addEventListener('selectstart', (e) => log(`select start (${e.inputSource.hand ? 'hand' : 'controller'} ${e.inputSource.handedness})`));
@@ -247,7 +251,7 @@ class RoomCatSystem extends createSystem({
   /** SK-HUD: the WebXR input sources -> hud-menu.js sources { left, right } (reused scratch; the bridge adds hand fingertips).
    *  ray = targetRaySpace (origin + -Z), select = selectstart / selectend, button = xr-standard 3 (thumbstick click) / 4 / 5 (X Y / A B). */
   readHud(frame, ref) {
-    const mk = () => ({ kind: 'controller', ray: { o: { x: 0, y: 0, z: 0 }, d: { x: 0, y: 0, z: -1 } }, select: false, button: false, tip: null, grip: { x: 0, y: 0, z: 0 } });
+    const mk = () => ({ kind: 'controller', ray: { o: { x: 0, y: 0, z: 0 }, d: { x: 0, y: 0, z: -1 } }, select: false, squeeze: false, button: false, tip: null, grip: { x: 0, y: 0, z: 0 } });
     const S = this.hudScratch || (this.hudScratch = { sources: { left: null, right: null }, slots: { left: mk(), right: mk() }, hide: false, wristToggle: false });
     S.sources.left = null; S.sources.right = null;
     const session = frame && frame.session;
@@ -262,6 +266,7 @@ class RoomCatSystem extends createSystem({
       slot.ray.d.x = -m[8]; slot.ray.d.y = -m[9]; slot.ray.d.z = -m[10];
       slot.kind = src.hand ? 'hand' : 'controller';
       slot.select = !!(this.hudSel && this.hudSel.get(src));
+      slot.squeeze = !src.hand && !!(this.hudSq && this.hudSq.get(src));
       const b = !src.hand && src.gamepad ? src.gamepad.buttons : null;
       slot.button = !!(b && ((b[3] && b[3].pressed) || (b[4] && b[4].pressed) || (b[5] && b[5].pressed)));
       slot.tip = null;
@@ -307,6 +312,7 @@ class RoomCatSystem extends createSystem({
       floorY, postureFloorY, kinds: inputKinds(frame.session), hud: this.readHud(frame, ref),
     });
     if (result && result.hud) for (const h of result.hud.haptics) pulseHand(frame.session.inputSources, h.hand, h.strength, h.ms); // SK-HUD hover tick / click
+    if (result && result.petHaptics) for (let i = 0; i < result.petHaptics.length; i++) { const h = result.petHaptics[i]; pulseHand(frame.session.inputSources, h.hand, h.strength, h.ms); } // GE2-B: the purr rumble on the petting controller (and the one holding her)
     if (result && result.hud) for (const e of result.hud.events) { if (e.type === 'select') sound.play('tick'); else if (e.type === 'blocked') sound.play('pat'); } // commit / greyed sounds (hands too; silent before the Enter tap)
     if (DEV && result && result.hud) for (const e of result.hud.events) if (e.type === 'select' || e.type === 'menu_open' || e.type === 'menu_close') log(`hud: ${e.type}${e.action ? ' ' + e.action : ''} ${e.hand || ''}`);
     if (DEV && this.perf && this.perf.programsAtStart == null && this.life.started) { this.perf.programsAtStart = this.perf.info ? this.perf.info.programs : -1; this.perf.event('started', { programs: this.perf.programsAtStart, prebuilt: !!this.life.hook.bridge.prebuilt }); }

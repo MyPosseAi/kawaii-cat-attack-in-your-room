@@ -75,7 +75,7 @@ export function progressStep(prev, events, state, simEvents) {
 export const HINTS = Object.freeze([
   { id: 'box', text: 'Pinch the box flaps to open it', anchor: 'box', from: 0, until: Infinity,
     ready: (c) => !!(c.box && c.box.landed) && !c.boxOpen, done: (c) => c.boxOpen },
-  { id: 'pet', text: 'Pet her: stroke her back slowly', anchor: 'cat', from: 0, until: 150,
+  { id: 'pet', text: 'Pet her: hold a hand over her back', anchor: 'cat', from: 0, until: 150,
     ready: (c) => c.catsOut > 0 && c.t >= c.firstOutT + 6, done: (c) => c.pets > 0 },
   { id: 'carry', text: 'Pinch the scruff of her neck to pick her up', anchor: 'cat', from: 0, until: 150,
     ready: (c) => c.pets > 0 || (c.catsOut > 0 && c.t >= 90), done: (c) => c.carries > 0 },
@@ -96,7 +96,7 @@ export const HINTS = Object.freeze([
 export const HINTS_SLICE = Object.freeze([
   { id: 'box', text: 'Pinch the box flaps to open it', anchor: 'box', from: 0, until: Infinity,
     ready: (c) => !!(c.box && c.box.landed) && !c.boxOpen, done: (c) => c.boxOpen },
-  { id: 'pet', text: 'Stroke her back slowly', anchor: 'cat', from: 0, until: Infinity,
+  { id: 'pet', text: 'Pet her: hold a hand over her back', anchor: 'cat', from: 0, until: Infinity,
     ready: (c) => c.catsOut > 0 && c.t >= c.firstOutT + 4, done: (c) => c.pets > 0 },
   { id: 'treat', text: 'Hold your palm up, flat and still, for a treat', anchor: 'hand', from: 0, until: Infinity,
     ready: (c) => c.catsOut > 0 && (c.pets > 0 || c.t >= c.firstOutT + 20), done: (c) => c.handClimbs > 0 || c.hugs > 0 || c.eats > 0 },
@@ -196,4 +196,86 @@ export function captionStep(prev, cues, t, tuning) {
     break;
   }
   return { state: st, caption: st.text, changed: before !== st.text };
+}
+
+// ---- Tip card (GE2-B, merged from tip-card.js so the public allowlist needs no new file) ----
+/* vr/src/tip-card.js - GE2-B (the owner's Quest test 2026-10-11 #2: "the help tips are in the way"). PURE placement + fade of the
+   hint / caption card (no three / WebXR / DOM); room-hook.js draws it from the visual this returns. Gaming Engineer 2.
+   Before: a 42 x 12 cm card 0.9 m straight ahead, 22 cm under the eye line, drawn over everything (depthTest off), so it sat on
+   the kittens and on the HUD menu tiles, and it never went away.
+   Now (gpm-quest3: panels world-locked with a lazy follow, never head-locked; frequent items low):
+     - SMALL (26 x 7.5 cm) and LOW + TO THE SIDE: 0.75 m out, sideDeg (32 deg) off the gaze toward the off hand (left by default,
+       right for a left-handed player), 0.36 m under the eye line (~26 deg down): clear of the HUD strip / tiles (+-10 deg, centred)
+       and of the floor in front where the kittens play.
+     - LAZY FOLLOW: placed when a new text shows; world-locked while it shows; eased back only when the gaze turned more than
+       followDeg away (or the head moved followM).
+     - AUTO-FADE: full for holdS (4.5 s), then fades out over fadeS. A NEW text shows again; the same text never re-shows.
+     - ANY TAP DISMISSES: a trigger / pinch / grip press from any source fades it at once (dismissFadeS) until the text changes.
+     - Never over the menu: while the action menu is open the card fades out (it comes back when the menu closes, if time is left).
+   tipCardStep(st, { t, dt, text, head: {x,y,z}, gaze: {x,y,z}, tap, menuOpen, leftHanded }) -> st.visual (REUSED object):
+     { show, placed, alpha, text, x, y, z, yaw, w, h } (yaw = rotation about +y so the card faces the head).
+   Build rule: only `export function` / `export const`; private names carry the `tc` prefix. */
+export const TIP_CARD_VERSION = 1;
+export const TIP_TUNING = Object.freeze({
+  w: 0.26, h: 0.075, ahead: 0.75, below: 0.36, sideDeg: 32,
+  holdS: 4.5, fadeS: 0.6, dismissFadeS: 0.15, menuFadeS: 0.15,
+  followDeg: 40, followM: 0.35, followRate: 4,
+});
+
+export function createTipCard(opts = {}) {
+  const T = Object.assign({}, TIP_TUNING, opts.tuning || {});
+  return { T, text: '', since: -Infinity, dismissed: false, alpha: 0, placed: false, pos: { x: 0, y: 0, z: 0 }, aim: { x: 0, z: -1 }, following: false,
+    visual: { show: false, placed: false, alpha: 0, text: '', x: 0, y: 0, z: 0, yaw: 0, w: T.w, h: T.h } };
+}
+
+/** the target spot for a head + gaze (writes st's scratch target) */
+function tcTarget(st, head, gaze, left, out) {
+  const T = st.T;
+  let gx = gaze ? gaze.x : 0, gz = gaze ? gaze.z : -1; const l = Math.sqrt(gx * gx + gz * gz);
+  if (l < 1e-6) { gx = st.aim.x; gz = st.aim.z; } else { gx /= l; gz /= l; }
+  const a = (left ? 1 : -1) * T.sideDeg * Math.PI / 180, c = Math.cos(a), s = Math.sin(a);
+  // rotate the flat gaze about +y: positive = to the LEFT of the gaze (three.js / WebXR: -z forward, +x right)
+  const dx = gx * c + gz * s, dz = -gx * s + gz * c;
+  out.x = head.x + dx * T.ahead; out.y = head.y - T.below; out.z = head.z + dz * T.ahead;
+  return out;
+}
+const TC_TMP = { x: 0, y: 0, z: 0 };
+
+/** One frame. See the header. */
+export function tipCardStep(st, inp) {
+  const T = st.T, v = st.visual, t = Number.isFinite(inp.t) ? inp.t : 0, dt = inp.dt > 0 ? inp.dt : 0;
+  const text = inp.text ? String(inp.text) : '';
+  let fresh = false;
+  if (text !== st.text) { fresh = !!text && st.alpha < 0.5; st.text = text; st.since = t; st.dismissed = false; if (text) st.following = true; }
+  if (inp.tap && text && st.alpha > 0.01) st.dismissed = true;
+  // the alpha this card wants
+  let want = 0;
+  if (text && !st.dismissed && !inp.menuOpen) {
+    const age = t - st.since;
+    want = age <= T.holdS ? 1 : Math.max(0, 1 - (age - T.holdS) / T.fadeS);
+  }
+  const rate = st.dismissed || inp.menuOpen ? 1 / Math.max(1e-3, st.dismissed ? T.dismissFadeS : T.menuFadeS) : 1 / Math.max(1e-3, T.fadeS * 0.5);
+  if (want > st.alpha) st.alpha = Math.min(want, st.alpha + rate * dt * 4); // in quickly (~0.15 s)
+  else st.alpha = Math.max(want, st.alpha - rate * dt);
+  if (want >= 1 && st.alpha < 1 && dt === 0) st.alpha = 1;
+  // placement: placed on a new text, eased while following, world-locked otherwise
+  const head = inp.head;
+  if (head && Number.isFinite(head.x)) {
+    const tg = tcTarget(st, head, inp.gaze, inp.leftHanded ? false : true, TC_TMP);
+    if (!st.placed) { st.pos.x = tg.x; st.pos.y = tg.y; st.pos.z = tg.z; st.placed = true; st.following = false; }
+    else {
+      const dx = st.pos.x - tg.x, dy = st.pos.y - tg.y, dz = st.pos.z - tg.z, off = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (off > 2 * T.ahead * Math.sin(T.followDeg * Math.PI / 360) || Math.abs(dy) > T.followM) st.following = true;
+      if (st.following) {
+        const k = fresh || st.alpha < 0.02 ? 1 : 1 - Math.exp(-T.followRate * dt); // an invisible card jumps (no motion seen)
+        st.pos.x += (tg.x - st.pos.x) * k; st.pos.y += (tg.y - st.pos.y) * k; st.pos.z += (tg.z - st.pos.z) * k;
+        if (off < 0.01) st.following = false;
+      }
+    }
+    if (inp.gaze) { const gx = inp.gaze.x, gz = inp.gaze.z, gl = Math.sqrt(gx * gx + gz * gz); if (gl > 1e-6) { st.aim.x = gx / gl; st.aim.z = gz / gl; } }
+    v.yaw = Math.atan2(head.x - st.pos.x, head.z - st.pos.z);
+  }
+  v.x = st.pos.x; v.y = st.pos.y; v.z = st.pos.z;
+  v.alpha = st.alpha; v.text = st.text; v.placed = st.placed; v.show = st.alpha > 0.01 && !!st.text && st.placed;
+  return v;
 }

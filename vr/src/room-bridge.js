@@ -26,13 +26,17 @@ import { createProgress, progressStep, createHintState, hintStep, soundCues, cre
 import { buildEndCard, endCardDue } from './end-card.js';
 import { rememberSession, spotsForRoom } from './return-visit.js';
 import { createDirector, directorRoute, directorStep, ltStep, ltCatRecords, ltDot, offerRing, pointRay, startLaserTag, HAPPY_TUNING, DIRECTOR_TEXT } from './director.js';
-import { createHudMenu, hudMenuStep, hudToolEvents, hudFilterEvents, createLaserGate, laserGateFilter, hudStats, HUD_ACTIONS, HUD_CAPTIONS } from './hud-menu.js';
+import { createHudMenu, hudMenuStep, hudToolEvents, hudFilterEvents, createLaserGate, laserGateFilter, hudStats, hudPickCat, HUD_ACTIONS, HUD_CAPTIONS } from './hud-menu.js';
+import { createTipCard, tipCardStep } from './hints.js';
 const HUD_ACTION_LABEL = Object.fromEntries(HUD_ACTIONS.map((a) => [a.id, a.label]));
 const HUD_ACTION_TIP = Object.fromEntries(HUD_ACTIONS.map((a) => [a.id, a.tip]));
 import { createFx, fxStep } from './fx.js';
 import { HINTS_SLICE, HINT_TUNING_SLICE } from './hints.js';
 
-export const BRIDGE_VERSION = 6; // 6: SK-HUD quick-stat strip + action menu (hud-menu.js): controller ray + trigger / hand ray + pinch / poke pick the tool; hand-aware laser off
+export const BRIDGE_VERSION = 7; // 7 (GE2-B, the owner's Quest test 2026-10-11): every accepted pet lands (the event carries the kitten's back
+                                 //    point), distance petting (hand pinch / controller grip + ray), a kitten SEATED on the other open palm or on
+                                 //    a controller (pet it there, set down gently), purr haptics on the petting controller, the tip card (tip-card.js)
+                                 // 6: SK-HUD quick-stat strip + action menu (hud-menu.js): controller ray + trigger / hand ray + pinch / poke pick the tool; hand-aware laser off
                                  // // 5: head events to roomcat (CH M1). 2: laser clipped by walls / furniture sides, box pinch 0.15 m, treat view gate, input hint
                                  // 3 (W3): posture-aware treat (floorY), feather wand + basket, onboarding hints + captions, end card
                                  // 4 (P0a slice): roomcat v2 events collected per step (simEvents), the director (Happiness meter,
@@ -53,6 +57,17 @@ export const BRIDGE_TUNING = Object.freeze({
   headFlatMin: 0.35,  // the gaze's flat (xz) length must be at least this (pitch shallower than ~70 deg) to count as a forward for the head
                       // event; looking steeply down the xz part is noise, so the LAST GOOD forward is kept and only the move rule can fire (CK M1)
   shadowMaxDrop: 2.5, // contact shadow fades out over this drop (airborne / carried cats)
+  // GE2-B: hold a kitten in your hand (Owner #3) + distance petting + purr haptics
+  seatR: 0.16,        // a pinched kitten let go with her feet this close (sideways) over the other OPEN palm (facing up) sits on it ...
+  seatAbove: 0.3, seatBelow: 0.08, // ... and her feet between seatBelow under and seatAbove over the palm
+  seatUpOn: 0.35, seatUpOff: 0.1, seatLostS: 0.35, seatMaxS: 40, // palm-up hysteresis; the palm turned over / gone this long = set her down
+  seatLift: 0.01, ctlSeatLift: 0.04, // her feet sit this far over the palm / the controller grip
+  downV: 0.8,         // set down: she is lowered at this speed (m/s) to the surface under her, then let go 2 cm over it (no drop, no toss)
+  seatPetR: 0.2,      // a free hand / controller this close to a seated kitten's body pets her
+  sqGrabM: 0.25,      // controller grip (squeeze) this close to a kitten's scruff picks her up (she sits on the controller)
+  rayPetR: 0.3,       // hand pinch / controller grip that grabs nothing: the kitten within this of the ray is petted while it holds
+  grabNearM: 0.12,    // a hand pinch this close to a scruff is a grab (never a distance pet)
+  petHapEveryS: 0.14, petHap: 0.35, petHapMs: 45, // the purr rumble on a petting controller (and the one holding her)
 });
 
 // ---------------------------------------------------------------- 1. scene -> room input (pure)
@@ -270,7 +285,10 @@ export function gestureToRoomEvents(ev, ctx) {
     case 'point_end': return [{ type: 'laser', on: false, hand }];
     case 'palm_start': return [{ type: 'treat', on: true, hand, p: ev.p }];
     case 'palm_end': return [{ type: 'treat', on: false, hand }];
-    case 'pet_start': case 'pet_hold': return [{ type: 'pet', hand, p: ev.p }];
+    // GE2-B root cause: roomcat purrs only within petR (0.25 m) of the kitten's back, measured from THIS point. The palm the
+    // gesture accepted could be farther (petFar 0.35 while holding, a hand over her), so pet_hold reached roomcat and nothing
+    // happened. The gesture's target point (q = the back it is stroking) is what roomcat gets, so an accepted pet always lands.
+    case 'pet_start': case 'pet_hold': { const q = ev.q && Number.isFinite(ev.q.x) ? ev.q : null; return [{ type: 'pet', hand, p: q ? { x: q.x, y: q.y, z: q.z } : ev.p }]; }
     default: return [];
   }
 }
@@ -435,6 +453,11 @@ export function createRoomBridge(opts = {}) {
     _firstT: null, _accepted: null, _keyT: null, _lastScene: null, _lastViewer: null, _lastForward: null, _lastFloorY: 0, _liveAccepted: null,
     hud: null, _hudHead: { p: null, fwd: null }, _hudMerge: [], _laserGate: createLaserGate(), _hudTctx: { head: null, floorY: 0, targets: null, grabs: null, dt: 0, forceLaser: false }, _hudEnabled: { laser_tag: false },
     _scratch: {}, _prevState: null, _fxPrev: null, _gest: [], _empty: [], _ltState: { cats: [] }, _prebuilt: null, prebuilt: false, _headSent: null, _headFwd: { x: 0, z: -1 },
+    // GE2-B: seated kitten { cat, carrier, support, kind: 'palm' | 'ctl', lost, since, down: { x, y, z, yEnd } | null, purrUntil, nextPurr }
+    seated: null, _gr: { left: null, right: null }, _pinchP: { left: { x: 0, y: 0, z: 0, ok: false }, right: { x: 0, y: 0, z: 0, ok: false } },
+    _rayPet: { left: null, right: null }, _sq: { left: null, right: null }, _sel: { left: false, right: false }, _sqWas: { left: false, right: false },
+    _hapT: { left: -Infinity, right: -Infinity }, _hapPool: [{ hand: '', strength: 0, ms: 0 }, { hand: '', strength: 0, ms: 0 }], petHaptics: [], _tapped: false,
+    tip: createTipCard(), _tipLines: [],
   };
   for (const h of T.hands) b.gestures[h] = createGestureState(h);
 
@@ -510,7 +533,7 @@ export function createRoomBridge(opts = {}) {
   const EMPTY = Object.freeze({ cats: [], views: {}, state: null, events: [], simEvents: [], wand: null, hint: null, hintChanged: false, caption: null, captionChanged: false, endCard: null, memory: null, fx: null, director: null });
   b.frame = (dt, handSamples, camera, gaze, floorY, hudIn) => {
     if (!b.session) return EMPTY;
-    b.time += dt;
+    b.time += dt; dt0 = dt;
     const D = b.director, route = directorRoute(D);
     const targets = b.state ? b.state.cats.filter((c) => c.mode !== 'inbox' && c.support !== 'hand').map(catBackPoint) : [];
     const ctx = { room: b.room, laserMaxM: T.laserMaxM, boxPinchM: T.boxPinchM, box: b.state && b.state.box };
@@ -550,9 +573,12 @@ export function createRoomBridge(opts = {}) {
        tc.floorY = b.roomInput ? b.roomInput.floorY : 0; tc.targets = targets; tc.dt = dt;
       tc.grabs = b.state && b.hud.active === 'toss' ? b.state.cats.filter((c) => c.mode !== 'inbox' && c.mode !== 'carried').map((c) => ({ x: c.x, y: c.y + (ROOMCAT_SIZES[c.size] || ROOMCAT_SIZES.kitten).scruff, z: c.z })) : null;
     }
+    // GE2-B: both hands' gestures first (a kitten let go over the OTHER hand's open palm sits on it), then their events
+    const gr = b._gr;
+    for (const h of T.hands) { const r = gestureStep(b.gestures[h], byHand[h] || null, targets, null, view); b.gestures[h] = r.state; gr[h] = r; }
+    b._tapped = false; b.petHaptics.length = 0;
     for (const h of T.hands) {
-      const r = gestureStep(b.gestures[h], byHand[h] || null, targets, null, view);
-      b.gestures[h] = r.state;
+      const r = gr[h];
       let hev = r.events;
       if (hm) { // the active tool's events join the hand's own, then the menu's suppression (the menu click never reaches a cat)
         const m = b._hudMerge; let k = 0;
@@ -563,15 +589,24 @@ export function createRoomBridge(opts = {}) {
       }
       for (const ev of hev) {
         gest.push(ev);
+        if (ev.type === 'pinch_start') b._tapped = true; // any pinch dismisses the tip card
         if (route === 'lt') continue; // Laser Tag: the Play sim is frozen; the point ray goes to lasertag-room below
+        if (ev.type === 'pinch_start' || ev.type === 'pinch_hold') { const pp = b._pinchP[h]; if (ev.p) { pp.x = ev.p.x; pp.y = ev.p.y; pp.z = ev.p.z; pp.ok = true; } }
+        // GE2-B (Owner #3): the carrier lets go over the other open palm -> she sits there (no toss); a pinch back at her picks her up again
+        if (ev.type === 'pinch_release' && seatOnPalm(h)) continue;
+        if (ev.type === 'pinch_start' && b.seated && b.seated.carrier === h && !b.seated.down && b.seated.kind === 'palm' && nearScruff(b.seated.cat, ev.p, T.grabNearM * 1.5)) { b.seated = null; continue; }
+        if (ev.type === 'pinch_release' || ev.type === 'lost') b._rayPet[h] = null;
         // the wand sees every gesture first: a pinch at its handle picks it up (that pinch is not a scruff / box pinch)
         const w = wandStep(b.wand, ev, wctx);
         b.wand = w.state;
         for (const we of w.events) events.push(we);
         if (w.consumed) continue;
+        // GE2-B: a hand pinch that grabs nothing (no scruff / box lid near) with the hand ray on a kitten pets her while it holds
+        if (ev.type === 'pinch_start' && srcs && srcs[h] && srcs[h].kind === 'hand' && !grabbable(ev.p)) { const c = hudPickCat(targets, srcs[h].ray, null, T.rayPetR); b._rayPet[h] = c ? c.id : null; }
         for (const re of gestureToRoomEvents(ev, ctx)) events.push(re); // the Play laser stays live while Laser Tag is offered (review BB S1): the floor ring is the start target
       }
     }
+    if (route !== 'lt') handExtras(targets, srcs, events);
     const simEvents = b.simEvents; simEvents.length = 0;
     const n = b.loop.advance(dt * 1000);
     let bb;
@@ -594,6 +629,7 @@ export function createRoomBridge(opts = {}) {
       } else if (events.length) {
         for (const e of events) b.session.push(e); // no step this frame: queue for the next one (no event is dropped)
       }
+      seatPose(simEvents);
       bb = catsToBillboards(b.state, b.room, camera || { x: 0, y: 1.2, z: 0 }, b.views);
     }
     b.views = bb.views;
@@ -633,10 +669,144 @@ export function createRoomBridge(opts = {}) {
       b.memory = rememberSession(opts.memory || null, b.state, b.room, opts.visit || 1, opts.roster || b.state.cats.map((c) => c.id));
       if (onLog) onLog('end card');
     }
+    // GE2-B (Owner #2): the hint / caption card: small, low and to the side, fades after a few seconds, any tap dismisses it, never over the menu
+    const tl = b._tipLines; tl.length = 0;
+    if (b.hint && b.hint.text) tl.push(b.hint.text);
+    if (b.caption) tl.push(b.caption);
+    if (srcs) for (const h of T.hands) { const sc = srcs[h], on = !!(sc && (sc.select || sc.squeeze)); if (on && !b._sel[h]) b._tapped = true; b._sel[h] = on; }
+    const tipCard = tipCardStep(b.tip, { t: b.time, dt, text: tl.join('\n'), head: camera || null, gaze: gaze || null, tap: b._tapped, menuOpen: !!(hm && hm.visual.open), leftHanded: !!opts.leftHanded });
     const dir = { mode: dmode, route, meter: D.meter.value, meterFull: D.meter.full, celebrate: D.celebrate, scorecard: D.scorecard, hud: D.hud, dot: route === 'lt' ? dotNow : null, ring: offerRing(D), best: D.best, round: D.ltRound };
     const hud = hm ? { visual: hm.visual, events: hm.events, haptics: hm.haptics, stats: hudStats(dir, b.state, b.hud.active) } : null;
-    return { cats: bb.cats, views: bb.views, state: b.state, events, simEvents, wand: route === 'lt' ? null : wandView(b.wand), hint: b.hint, hintChanged, caption: b.caption, captionChanged: cr.changed, endCard: b.endCard, memory: b.memory, fx: b.fx, director: dir, hud };
+    return { cats: bb.cats, views: bb.views, state: b.state, events, simEvents, wand: route === 'lt' ? null : wandView(b.wand), hint: b.hint, hintChanged, caption: b.caption, captionChanged: cr.changed, endCard: b.endCard, memory: b.memory, fx: b.fx, director: dir, hud, tipCard, petHaptics: b.petHaptics, seated: b.seated };
   };
+
+  // ---------------------------------------------------------------- GE2-B helpers (closures over b / T)
+  const sizeOf = (c) => ROOMCAT_SIZES[c && c.size] || ROOMCAT_SIZES.kitten;
+  const catOf = (id) => { if (!b.state || id == null) return null; for (const c of b.state.cats) if (c.id === id) return c; return null; };
+  function nearScruff(id, p, r) { const c = catOf(id); if (!c || !p) return false; const dx = p.x - c.x, dy = p.y - (c.y + sizeOf(c).scruff), dz = p.z - c.z; return dx * dx + dy * dy + dz * dz <= r * r; }
+  /** a pinch at p grabs something in roomcat (a scruff within grabNearM, or the closed box's lid): never a distance pet */
+  function grabbable(p) {
+    if (!p || !b.state) return false;
+    for (const c of b.state.cats) { if (c.mode === 'inbox' || c.mode === 'carried') continue; const dx = p.x - c.x, dy = p.y - (c.y + sizeOf(c).scruff), dz = p.z - c.z; if (dx * dx + dy * dy + dz * dz <= T.grabNearM * T.grabNearM) return true; }
+    const bx = b.state.box; if (bx && bx.landed && !bx.open) { const dx = p.x - bx.x, dy = p.y - (bx.y + ROOMCAT_TUNING.boxH), dz = p.z - bx.z; if (dx * dx + dy * dy + dz * dz <= 0.09) return true; }
+    return false;
+  }
+  /** the open palm of hand h (features) facing up enough (on / off threshold), not pinching, else null */
+  function openPalm(h, on) {
+    const r = b._gr[h], f = r && r.features, g = b.gestures[h];
+    if (!f || g.pinch || g.point) return null;
+    if (!(f.normal.y >= (on ? T.seatUpOn : T.seatUpOff))) return null;
+    const e = f.ext, open = (e.index >= 0.5) + (e.middle >= 0.5) + (e.ring >= 0.5) + (e.pinky >= 0.5);
+    return open >= 2 ? f.palm : null;
+  }
+  /** hand `a` lets go of the kitten it carries: over the other hand's open palm she sits there (Owner #3). true = seated */
+  function seatOnPalm(a) {
+    if (b.seated || !b.state) return false;
+    const pp = b._pinchP[a]; if (!pp.ok) return false;
+    let cat = null, bd = 0.12 * 0.12;
+    for (const c of b.state.cats) { if (c.mode !== 'carried') continue; const dx = c.x - pp.x, dy = c.y + sizeOf(c).scruff - pp.y, dz = c.z - pp.z, d2 = dx * dx + dy * dy + dz * dz; if (d2 <= bd) { bd = d2; cat = c; } }
+    if (!cat) return false;
+    const other = a === 'left' ? 'right' : 'left', palm = openPalm(other, true);
+    if (!palm) return false;
+    const side = Math.hypot(cat.x - palm.x, cat.z - palm.z), up = cat.y - palm.y;
+    if (side > T.seatR || up > T.seatAbove || up < -T.seatBelow) return false;
+    b.seated = { cat: cat.id, carrier: a, support: other, kind: 'palm', lost: null, since: b.time, down: null, purrUntil: -Infinity, nextPurr: -Infinity };
+    return true;
+  }
+  /** a pet room event at kitten `id`'s back (the point roomcat measures petR from) */
+  function petAt(events, hand, id) { const c = catOf(id); if (!c) return false; const q = catBackPoint(c); events.push({ type: 'pet', hand, p: { x: q.x, y: q.y, z: q.z } }); return true; }
+  function rumble(hand) {
+    const srcs = b._srcs; if (!srcs || !srcs[hand] || srcs[hand].kind === 'hand') return; // hands have no actuator
+    if (b.time - b._hapT[hand] < T.petHapEveryS - 1e-9) return;
+    for (const h of b.petHaptics) if (h.hand === hand) return;
+    const o = b._hapPool[b.petHaptics.length]; if (!o) return;
+    b._hapT[hand] = b.time; o.hand = hand; o.strength = T.petHap; o.ms = T.petHapMs; b.petHaptics.push(o);
+  }
+  /** after the gesture events: distance pets, controller grip (squeeze), the seat (virtual carrier moves, set-down), pets on a seated kitten, rumble */
+  function handExtras(targets, srcs, events) {
+    b._srcs = srcs;
+    const seat = b.seated;
+    // 1. the seat's carrier hand no longer drives her: its own moves / pinches / releases are dropped (she follows the palm / controller)
+    if (seat) {
+      let n = 0;
+      for (let i = 0; i < events.length; i++) { const e = events[i]; if (e.hand === seat.carrier && (e.type === 'move' || e.type === 'pinch' || e.type === 'release')) continue; if (e.hand === seat.support && seat.kind === 'palm' && e.type === 'treat' && e.on !== false) continue; events[n++] = e; }
+      events.length = n;
+    }
+    // 2. hand pinch + ray distance pet (while the pinch holds)
+    for (const h of T.hands) { const id = b._rayPet[h]; if (id == null) continue; if (!b.gestures[h].pinch || !petAt(events, h, id)) b._rayPet[h] = null; }
+    // 3. controllers: grip (squeeze) near a kitten picks her up onto the controller; elsewhere it pets the kitten on its ray
+    if (srcs) for (const h of T.hands) {
+      const sc = srcs[h], sq = !!(sc && sc.kind === 'controller' && sc.squeeze), was = b._sqWas[h]; b._sqWas[h] = sq;
+      const grip = sc && (sc.grip || (sc.ray && sc.ray.o));
+      if (sq && !was && grip) {
+        let best = null, bd = T.sqGrabM * T.sqGrabM;
+        if (!b.seated && b.state) for (const c of b.state.cats) { if (c.mode === 'inbox' || c.mode === 'carried' || c.sulk) continue; const dx = grip.x - c.x, dy = grip.y - (c.y + sizeOf(c).scruff), dz = grip.z - c.z, d2 = dx * dx + dy * dy + dz * dz; if (d2 <= bd) { bd = d2; best = c; } }
+        if (best) { const q = { x: best.x, y: best.y + sizeOf(best).scruff, z: best.z }; events.push({ type: 'pinch', hand: h, p: q }); b.seated = { cat: best.id, carrier: h, support: h, kind: 'ctl', lost: null, since: b.time, down: null, purrUntil: -Infinity, nextPurr: -Infinity }; b._sq[h] = 'grab'; }
+        else { const c = hudPickCat(targets, sc.ray, null, T.rayPetR); b._sq[h] = c ? c.id : null; }
+      } else if (sq && b._sq[h] != null && b._sq[h] !== 'grab') { if (!petAt(events, h, b._sq[h])) b._sq[h] = null; }
+      else if (!sq && was) { if (b._sq[h] === 'grab' && b.seated && b.seated.kind === 'ctl' && b.seated.carrier === h) setDown(); b._sq[h] = null; }
+    }
+    // 4. the seat: she follows the palm / controller; a palm turned over or gone (seatLostS), or seatMaxS, sets her down gently
+    const st = b.seated;
+    if (st) {
+      const c = catOf(st.cat);
+      if (!c || (c.mode !== 'carried' && c.mode !== 'onhand' && b.time - st.since > 0.1)) { b.seated = null; }
+      else {
+        const sz = sizeOf(c);
+        if (!st.down) {
+          let at = null;
+          if (st.kind === 'palm') { const palm = openPalm(st.support, false); if (palm) at = { x: palm.x, y: palm.y + T.seatLift, z: palm.z }; }
+          else { const sc = srcs && srcs[st.support], g = sc && (sc.grip || (sc.ray && sc.ray.o)); if (g) at = { x: g.x, y: g.y + T.ctlSeatLift, z: g.z }; }
+          if (at) { st.lost = null; st.at = at; } else if (st.lost == null) st.lost = b.time;
+          if ((st.lost != null && b.time - st.lost >= T.seatLostS) || b.time - st.since > T.seatMaxS) setDown();
+          else { const a = st.at || { x: c.x, y: c.y, z: c.z }; events.push({ type: 'move', hand: st.carrier, p: { x: a.x, y: a.y + sz.scruff, z: a.z } }); }
+        }
+        if (st.down) {
+          const d = st.down; d.y = Math.max(d.yEnd, d.y - T.downV * dt0);
+          events.push({ type: 'move', hand: st.carrier, p: { x: d.x, y: d.y + sz.scruff, z: d.z } });
+          if (d.y <= d.yEnd + 1e-6) { events.push({ type: 'release', hand: st.carrier, v: { x: 0, y: 0, z: 0 } }); b.seated = null; }
+        }
+      }
+    }
+    // 5. a free hand / controller at the seated kitten pets her (roomcat leaves a carried kitten alone: the bridge purrs her)
+    const s2 = b.seated;
+    if (s2 && !s2.down) {
+      const c = catOf(s2.cat);
+      if (c) {
+        const cx = c.x, cy = c.y + sizeOf(c).h * 0.55, cz = c.z, r2 = T.seatPetR * T.seatPetR;
+        let petter = null;
+        const near = (p) => !!p && (p.x - cx) * (p.x - cx) + (p.y - cy) * (p.y - cy) + (p.z - cz) * (p.z - cz) <= r2;
+        for (const h of T.hands) {
+          if (h === s2.support) continue; // the palm / controller she sits on is not the one stroking her
+          const f = b._gr[h] && b._gr[h].features, sc = srcs && srcs[h];
+          if (f && !b.gestures[h].pinch && (near(f.palm) || near(f.indexTip))) { petter = h; break; }
+          if (sc && sc.kind === 'controller' && near(sc.grip || (sc.ray && sc.ray.o))) { petter = h; break; }
+        }
+        if (petter) {
+          s2.purrUntil = b.time + 1.2; petAt(events, petter, s2.cat); rumble(petter); if (s2.support !== petter) rumble(s2.support);
+        }
+      }
+    }
+    // 6. the purr rumble for every pet a controller sends (proximity, Pet tool, trigger at a kitten, grip + ray)
+    if (srcs) for (let i = 0; i < events.length; i++) { const e = events[i]; if (e.type === 'pet' && e.hand && srcs[e.hand] && srcs[e.hand].kind === 'controller') rumble(e.hand); }
+  }
+  let dt0 = 0;
+  /** start lowering the seated kitten to the surface under her (then let go 2 cm over it: no drop, no toss) */
+  function setDown() {
+    const st = b.seated; if (!st || st.down) return;
+    const c = catOf(st.cat); if (!c) { b.seated = null; return; }
+    const hit = b.room ? roomRaycast(b.room, { x: c.x, y: c.y + 0.01, z: c.z }, { x: 0, y: -1, z: 0 }) : null;
+    const yEnd = (hit ? hit.y : (b.roomInput ? b.roomInput.floorY : 0)) + 0.02;
+    st.down = { x: c.x, y: Math.max(c.y, yEnd), z: c.z, yEnd };
+  }
+  /** the seated kitten's look: sitting (petted while stroked), purring; the sim's carried state is not drawn as a scruff hang */
+  function seatPose(simEvents) {
+    const st = b.seated; if (!st || !b.state) return;
+    const c = catOf(st.cat); if (!c || c.mode !== 'carried') return;
+    const purring = b.time < st.purrUntil;
+    c.mode = 'onhand'; c.pose = purring ? 'petted' : 'sit'; c.purr = purring || c.purr;
+    if (purring && b.time >= st.nextPurr) { st.nextPurr = b.time + ROOMCAT_TUNING.petCdS; simEvents.push({ type: 'purr', cat: c.id, hearts: c.hearts || 0, bond: c.bond || 0, seated: true }); }
+  }
 
   b.openBox = () => { if (b.session) b.session.openBox(); };
   b.dispose = () => {

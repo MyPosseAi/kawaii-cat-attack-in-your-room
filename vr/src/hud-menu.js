@@ -36,7 +36,9 @@
      visual = { open, hidden, active, pose: { c, r, u, n }, button: { p, hover, w, h }, tiles: [{ id, label, p, hover,
        active, disabled }], cursors: { left: p | null, right: p | null } }
    Build rule: only `export function` / `export const`; private names carry the `hm` / `HM_` prefix. */
-export const HUD_MENU_VERSION = 1;
+export const HUD_MENU_VERSION = 2; // 2 (GE2-B, the owner's Quest test 2026-10-11 petting): controller pet reach is a column over the kitten
+                                    // (petAboveM), a Laser trigger aimed AT a kitten pets her (lockR), pets pass the menu suppression unless that
+                                    // source holds a menu press (latch)
 
 export const HUD_TUNING = Object.freeze({
   ahead: 1.0, below: 0.4,            // QUEST3-HUD-COACH 1: 1.0 m ahead (never in the 0.5-0.8 m band), level, yaw-only; the strip 40 cm under
@@ -53,7 +55,9 @@ export const HUD_TUNING = Object.freeze({
   hoverHaptic: 0.15, hoverMs: 15, clickHaptic: 0.5, clickMs: 40, // coach 5 (own limiter: haptics.pulseHand, not the pounce limiter)
   closeOnSelect: true, closeS: 0.2, // the picked tile stays up (pressed) this long, then the menu closes (coach review MUST 2)
   beamM: 1.5, beamNearM: 0.1,       // the ray beam: to the hit point, else 1.5 m; shown while open or the ray is within 10 cm of the panel
-  petNearM: 0.22,                   // a controller this close to a kitten's back pets it (any tool)
+  petNearM: 0.22,                   // a controller this close to a kitten's back pets it (any tool) ...
+  petAboveM: 0.3,                   // ... or up to this much higher straight over her (a standing player's controller at ~0.65 m over a floor kitten)
+  lockR: 0.15,                      // Laser tool: a trigger press that STARTS with the ray this close to a kitten pets her for that hold (no dot)
   petRayR: 0.35, pickMaxM: 5,        // controller pet / grab: the nearest cat within 35 cm of the ray, up to 5 m
   callAheadM: 0.8,                   // "Call cats": a laser dot on the floor 0.8 m in front of the player while held
 });
@@ -74,7 +78,7 @@ const HM_BTN = 100, HM_NONE = -1;
 
 function hmV() { return { x: 0, y: 0, z: 0 }; }
 function hmSet(o, x, y, z) { o.x = x; o.y = y; o.z = z; return o; }
-function hmSrcState() { return { hover: HM_NONE, prevHover: HM_NONE, wasSel: false, wasBtn: false, latch: false, pokeIn: false, onPanel: false, toolOn: false, lock: -1, coolUntil: -1, onLock: false, dist: 0, rayPlane: false, gp: hmV(), lastGrip: hmV(), hasGrip: false, v: hmV(), cur: hmV(), hasCur: false, lu: 0, lv: 0 }; }
+function hmSrcState() { return { petLock: false, petId: null, hover: HM_NONE, prevHover: HM_NONE, wasSel: false, wasBtn: false, latch: false, pokeIn: false, onPanel: false, toolOn: false, lock: -1, coolUntil: -1, onLock: false, dist: 0, rayPlane: false, gp: hmV(), lastGrip: hmV(), hasGrip: false, v: hmV(), cur: hmV(), hasCur: false, lu: 0, lv: 0 }; }
 function hmEvPool(n) { const a = []; for (let i = 0; i < n; i++) a.push({ type: '', hand: '', target: '', action: '' }); return a; }
 function hmGestPool() { return { move: { type: 'move', hand: '', p: hmV() }, ps: { type: 'point_start', hand: '', origin: hmV(), dir: hmV() }, ph: { type: 'point_hold', hand: '', origin: hmV(), dir: hmV() }, pe: { type: 'point_end', hand: '' },
   pet: { type: 'pet_hold', hand: '', p: hmV() }, palmS: { type: 'palm_start', hand: '', p: hmV() }, palmE: { type: 'palm_end', hand: '' }, pinchS: { type: 'pinch_start', hand: '', p: hmV() }, pinchR: { type: 'pinch_release', hand: '', v: hmV() }, ptEnd: { type: 'point_end', hand: '' } }; }
@@ -314,9 +318,9 @@ export function hudSetActive(st, id) { if (!HUD_ACTION_IDS.includes(id) || HUD_A
 
 function hmNorm(o, x, y, z) { const l = Math.sqrt(x * x + y * y + z * z) || 1; return hmSet(o, x / l, y / l, z / l); }
 /** The cat nearest the ray (perpendicular distance <= petRayR, ahead, within pickMaxM) or null. cats = [{ x, y, z }]. */
-export function hudPickCat(cats, ray, tuning) {
+export function hudPickCat(cats, ray, tuning, radius) {
   const T = tuning || HUD_TUNING; if (!cats || !ray || !ray.o || !ray.d) return null;
-  let best = null, bd = T.petRayR;
+  let best = null, bd = radius > 0 ? radius : T.petRayR;
   for (let i = 0; i < cats.length; i++) {
     const c = cats[i]; const qx = c.x - ray.o.x, qy = c.y - ray.o.y, qz = c.z - ray.o.z, t = qx * ray.d.x + qy * ray.d.y + qz * ray.d.z;
     if (!(t > 0) || t > T.pickMaxM) continue;
@@ -346,20 +350,29 @@ export function hudToolEvents(st, hand, src, ctx) {
   const runs = isCtl || tool === 'call';
   const want = runs && !!src.select && !sup.all && !s.latch;
   sup.pinch = false;
-  // petting with a controller: held near a kitten's back it pets (any tool, not while grabbing); the Pet tool also pets by ray
-  if (isCtl && grip && !sup.all && !(s.toolOn && s.tool === 'toss') && c.targets) {
-    let best = null, bi = -1; const r2 = T.petNearM * T.petNearM; // squared distances, nearest by index (no double crosses a phi: GC test)
-    for (let i = 0; i < c.targets.length; i++) { const q = c.targets[i], dx = q.x - grip.x, dy = q.y - grip.y, dz = q.z - grip.z; if (dx * dx + dy * dy + dz * dz <= r2 && (bi < 0 || hmD2(q, grip) < hmD2(c.targets[bi], grip))) bi = i; }
+  // petting with a controller: held near / over a kitten's back it pets (any tool, not while grabbing); the Pet tool also pets
+  // by ray. GE2-B: the reach is a column over her (hmPetD2: a standing player's controller over a floor kitten) and only a
+  // MENU press (latch) blocks it (a ray grazing the strip while the controller is down at a kitten must not swallow the pet)
+  if (isCtl && grip && !s.latch && !(s.toolOn && s.tool === 'toss') && c.targets) {
+    let best = null, bi = -1, bd = T.petNearM * T.petNearM; // squared distances, nearest by index (no double crosses a phi: GC test)
+    for (let i = 0; i < c.targets.length; i++) { const d2 = hmPetD2(c.targets[i], grip, T.petAboveM); if (d2 <= bd) { bd = d2; bi = i; } }
     if (bi >= 0) best = c.targets[bi];
-    if (best && !(want && tool === 'pet')) { const e = g.pet; e.hand = hand; e.p.x = best.x; e.p.y = best.y; e.p.z = best.z; out[n++] = e; }
+    if (best && !(want && (tool === 'pet' || s.petLock))) { const e = g.pet; e.hand = hand; e.p.x = best.x; e.p.y = best.y; e.p.z = best.z; out[n++] = e; }
   }
-  if (want && !s.toolOn) { s.toolOn = true; s.tool = tool; n = hmToolStart(st, hand, src, c, out, n); }
-  else if (want && s.toolOn && s.tool === tool) n = hmToolHold(st, hand, src, c, out, n);
-  else if (s.toolOn) { n = hmToolEnd(st, hand, src, c, out, n); s.toolOn = false; if (want) { s.toolOn = true; s.tool = tool; n = hmToolStart(st, hand, src, c, out, n); } }
+  // Laser tool: a trigger that STARTS aimed at a kitten pets her for that hold (Meta: lock the target at selectstart)
+  if (want && !s.toolOn && isCtl && tool === 'laser' && !c.forceLaser && c.targets) {
+    const cat = hudPickCat(c.targets, src.ray, T, T.lockR);
+    if (cat) { s.toolOn = true; s.tool = 'pet'; s.petLock = true; s.petId = cat.id == null ? null : cat.id; n = hmToolHold(st, hand, src, c, out, n); out.length = n; return out; }
+  }
+  if (want && !s.toolOn) { s.toolOn = true; s.tool = tool; s.petLock = false; s.petId = null; n = hmToolStart(st, hand, src, c, out, n); }
+  else if (want && s.toolOn && (s.tool === tool || s.petLock)) n = hmToolHold(st, hand, src, c, out, n);
+  else if (s.toolOn) { n = hmToolEnd(st, hand, src, c, out, n); s.toolOn = false; s.petLock = false; s.petId = null; if (want) { s.toolOn = true; s.tool = tool; n = hmToolStart(st, hand, src, c, out, n); } }
   out.length = n;
   return out;
 }
 function hmD2(a, b) { const dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z; return dx * dx + dy * dy + dz * dz; }
+/** squared PET REACH distance (gestures.js petDist): height over the back counts only past `above` */
+function hmPetD2(q, p, above) { const dx = p.x - q.x, dz = p.z - q.z; let dy = p.y - q.y; if (dy > 0) dy = dy > above ? dy - above : 0; return dx * dx + dy * dy + dz * dz; }
 function hmCallRay(g, c, T) {
   const h = c.head && c.head.p ? c.head : null; if (!h) return false;
   let fx = h.fwd ? h.fwd.x : 0, fz = h.fwd ? h.fwd.z : -1; const fl = Math.sqrt(fx * fx + fz * fz) || 1; fx /= fl; fz /= fl;
@@ -377,7 +390,13 @@ function hmToolStart(st, hand, src, c, out, n) {
 function hmToolHold(st, hand, src, c, out, n) {
   const g = st.gest[hand], tool = st.src[hand].tool, T = st.T;
   if (tool === 'laser' || tool === 'call') { const e = g.ph; e.hand = hand; if (tool === 'laser' ? hmRayInto(e, src) : hmCallRay(e, c, T)) { out[n++] = e; st.live[hand] = true; } return n; }
-  if (tool === 'pet') { const cat = hudPickCat(c.targets, src.ray, T); if (cat) { const e = g.pet; e.hand = hand; hmSet(e.p, cat.x, cat.y, cat.z); out[n++] = e; } return n; }
+  if (tool === 'pet') {
+    const s = st.src[hand]; let cat = null;
+    if (s.petId != null && c.targets) for (let i = 0; i < c.targets.length; i++) if (c.targets[i].id === s.petId) { cat = c.targets[i]; break; } // sticky: the kitten picked at selectstart
+    if (!cat) { cat = hudPickCat(c.targets, src.ray, T); if (cat && cat.id != null) s.petId = cat.id; }
+    if (cat) { const e = g.pet; e.hand = hand; hmSet(e.p, cat.x, cat.y, cat.z); out[n++] = e; }
+    return n;
+  }
   return n; // treat / toss: the controller's move carries it
 }
 function hmToolEnd(st, hand, src, c, out, n) {
@@ -399,7 +418,8 @@ export function hudFilterEvents(st, events, into) {
   if (Array.isArray(events)) for (let i = 0; i < events.length; i++) {
     const e = events[i], h = e.hand === 'left' ? 'left' : 'right', s = st.suppress[h];
     const isPoint = e.type === 'point_start' || e.type === 'point_hold';
-    if (s && s.all && e.type !== 'move' && e.type !== 'lost') {
+    const isPet = e.type === 'pet_start' || e.type === 'pet_hold' || e.type === 'pet_end';
+    if (s && s.all && e.type !== 'move' && e.type !== 'lost' && !(isPet && !st.src[h].latch)) { // GE2-B: a pet is AT a kitten, never a menu click
       if ((isPoint || e.type === 'point_end') && st.live[h]) { const pe = st.gest[h].ptEnd; pe.hand = h; out[n++] = pe; st.live[h] = false; }
       continue;
     }

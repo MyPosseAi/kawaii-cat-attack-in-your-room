@@ -17,7 +17,11 @@
      { type: 'laser', on, p }           finger laser dot (host ray-casts; roomRaycast helps): interested cats chase, TELL (crouch
                                         tellS) then pounce at the dot's position at tell end; landing d to the dot: catch
                                         (<= catchR: pin pinS, then the cat ignores the dot laserMuteS so the player moves it),
-                                        near miss (catchR < d <= nearMissR) or a plain miss; pounceCdS per cat from the launch
+                                        near miss (catchR < d <= nearMissR) or a plain miss; pounceCdS per cat from the launch.
+                                        GE1-B 2026-10-11 (owner: "too easy"): a catch is EARNED: the kitten may hesitate (stare,
+                                        hesitate*) before the tell, a stale pounce (staleP) commits to where the dot was at the
+                                        tell start, a landed pounce can be fumbled (fumble*: pounce { fumbled: true, escaped:
+                                        true } + near_miss), a miss may bore the kitten (missBoredP: it sits out boredS)
      { type: 'wand', on, p, speed }     feather wand tip (speed m/s from the host): nearby cats bat at it; a fast tip (> bigLeapV)
                                         makes a cat tell (leapTellS) then BIG LEAP to the highest legal surface it can reach
      { type: 'treat', on, hand, p }     open palm treat: the nearest awake cat comes; palm low enough = hops ONTO the hand
@@ -79,7 +83,7 @@ export const ROOMCAT_TUNING = Object.freeze({
   // "behave like cats" (GDXE / GE1 2026-10-10; see the header): idle cycle, short walks + pauses, curiosity, home, stalk, doze
   wanderMaxM: 1.2, pauseS0: 0.4, pauseS1: 1.4, idleS0: 1.5, idleS1: 4.5, hopP: 0.12, stretchS: 1.2,
   curiousM: 2.5, curiousAgeS: 3, curiousP: 0.45, curiousStopM: 0.3, lookS0: 1.0, lookS1: 2.5, curiousDetourCdS: 2, hopOverN: 400, smoothLook: 10,
-  homeM: 1.6, homeP: 0.6,
+  homeM: 2.3, homeP: 0.6, // homeM 1.6 -> 2.3 (GE1-B 2026-10-11, owner: "play zone is small"): the kittens' home circle doubles in area; still a walk back, in view
   stalkM: 0.55, stalkV: 0.45,
   dozeAfterS: 20, dozeS0: 6, dozeS1: 12,
   // Review CH S3 (hand-tracking jitter): the pounce LEAD reads the dot's velocity over the last leadWinS (a ring of per-step dot
@@ -102,13 +106,23 @@ export const ROOMCAT_TUNING = Object.freeze({
   // pounceLeadS: the pounce leads a MOVING dot by its speed over the tell times the flight (0.31 s): a steady dot is
   // caught, a dot that changes direction during the tell / flight escapes (the player's skill); comboN catches within comboS = 'combo'; bigLeapV: wand tip speed that earns a big leap, leapTellS crouch first,
   // leapCoolS per cat, leapReach: landing within this of the tip (seated + in reach), leapRun: the run-up to the hop edge.
-  tellS: 0.25, pounceCdS: 1.2, pounceReach: 0.3, pounceLeadS: 0.31, missStareS: 1.2, catchR: 0.035, nearMissR: 0.16, pinS: 0.8, laserMuteS: 1.5, comboN: 3, comboS: 10, comboCdS: 25,
+  tellS: 0.4, pounceCdS: 2.0, pounceReach: 0.3, pounceLeadS: 0.31, missStareS: 1.6, catchR: 0.035, nearMissR: 0.16, pinS: 0.8, laserMuteS: 2.5, comboN: 3, comboS: 10, comboCdS: 25,
   // P0a Build 1 (GDXE fix 1): catchR 0.05 -> 0.035, nearMissR 0.1 -> 0.16, and a dot that moved more than escapeM during the
   // flight (launch -> landing) is never caught (the player's move is the escape): catches 35-50 % of pounces on the slow sweep
   escapeM: 0.12, // (comboCdS: one 'combo' caption per 25 s, so a slow-dot catch storm reads as <= 2 combos / min)
   // aimErr: the pounce aim scatters (seeded prng, uniform disc) by up to aimErr x the dot's travel during the tell: a still
   // dot is hit exactly, a moving one lands a few cm off either way (the lead's systematic error alone made catches a knife edge)
-  aimErr: 0.65,
+  aimErr: 0.65, aimErrS: 0.25, // aimErrS (GE1-B): the dot-travel window the scatter (and the held-dot dead zone) scales with = the old 0.25 s tell
+  // GE1-B 2026-10-11 (the owner's Quest test of the laser: "too easy for them to catch (but fun)"): a catch is EARNED, not instant.
+  // hesitateP: the first time a kitten gets inside pounceR on an approach it freezes (stare) for hesitateS0..S1 with this chance
+  // (reaction delay; the player sees it coming); staleP: the pounce commits to where the dot WAS when the tell started (no lead:
+  // a dot that kept moving during the tell is missed); fumbleP0 / fumbleK / fumbleMax: a pounce that landed on the dot is still
+  // fumbled (the paw slips: an escaped near miss) with chance fumbleP0 + dot speed (m/s, over leadWinS) x fumbleK, capped at
+  // fumbleMax (a fast dot is nearly never pinned); missBoredP / boredS: after a miss the kitten sometimes loses interest and sits
+  // watching the dot for boredS (the c.mute path). With them: tellS 0.25 -> 0.4, pounceCdS 1.2 -> 2.0, missStareS 1.2 -> 1.6,
+  // laserMuteS 1.5 -> 2.5. Measured (game/test/roomcat-laser-rate.test.mjs, 3 kittens on the rug): a slowly swept dot = one catch
+  // per 4-8 s of play (was 2 s), a still dot one per ~2 s (was 1 s), a fast dot one per 10+ s. All seeded: replays stay exact.
+  hesitateP: 0.5, hesitateS0: 0.3, hesitateS1: 0.8, staleP: 0.35, fumbleP0: 0.3, fumbleK: 0.35, fumbleMax: 0.85, missBoredP: 0.2, boredS: 3,
   // P0a fix round (same-surface stall): a straight walk blocked by a plane / obstacle on the SAME surface (a couch between the
   // kitten and the dot) plans a detour over the surface's sample grid (BFS + line-of-sight smoothing, rcGrid); retried every
   // detourCdS while blocked (no stare lock)
@@ -197,7 +211,7 @@ export function createRoomSession(opts = {}) {
       goal: 'wander', nap: null, eat: 0, hand: null, onT: 0, wave: Math.floor(i / T.waveSize), slot: i % T.waveSize, cool: 0, lastHop: 0,
       tell: 0, tellKind: null, tellX: 0, tellZ: 0, pin: 0, mute: 0, leapCool: 0, leap: null,
       hearts: 0, heartT: 0, treatCd: 0, peeked: false, detourCd: 0, detourTo: null, dotX0: 0, dotZ0: 0, hardT: [], sulk: 0, tossHard: false, nmTick: -1e9,
-      played: 0, wake: false, curDetCd: 0, // played = deeds that landed on this kitten (purr / eat / catch / gentle toss); wake = just woke from a doze (stretch first)
+      played: 0, wake: false, curDetCd: 0, hes: false, // hes = hesitated on this approach already (GE1-B) // played = deeds that landed on this kitten (purr / eat / catch / gentle toss); wake = just woke from a doze (stretch first)
       napSurf: typeof d.napSurf === 'string' && d.napSurf ? d.napSurf : null };
     if (arc) { c.x = s.box.x + (prng.next() - 0.5) * 0.12; c.z = s.box.z + (prng.next() - 0.5) * 0.12; c.y = s.box.y; c.surf = 'box'; }
     else { const p = prng.pick(floor.spots); c.x = p.x; c.z = p.z; c.y = floor.y; c.surf = floor.id; c.mode = 'idle'; c.pose = 'sit'; c.t = RC_T(prng.range(0.2, 1.5)); }
@@ -497,7 +511,12 @@ export function createRoomSession(opts = {}) {
       if (c.mute > 0) { c.mode = 'idle'; c.pose = 'sit'; c.t = RC_T(0.2); rcFace(c, L.x - c.x, L.z - c.z); return; }
       if (c.surf === L.surf) {
         const d = rcLen(L.x - c.x, L.z - c.z);
-        if (d <= T.pounceR && c.cool <= 0) { c.mode = 'tell'; c.pose = 'crouch'; c.tell = RC_T(T.tellS); c.tellKind = 'pounce'; c.tellX = L.x; c.tellZ = L.z; c.plan = []; rcFace(c, L.x - c.x, L.z - c.z); emit({ type: 'tell', cat: c.id, kind: 'pounce' }); return; }
+        if (d <= T.pounceR && c.cool <= 0) {
+          // GE1-B: the reaction delay: once per approach the kitten may freeze (stare at the dot) before the crouch tell
+          if (!c.hes) { c.hes = true; if (prng.chance(T.hesitateP)) { c.mode = 'idle'; c.pose = 'stare'; c.plan = [{ k: 'stare', n: RC_T(prng.range(T.hesitateS0, T.hesitateS1)) }]; rcFace(c, L.x - c.x, L.z - c.z); return; } }
+          c.hes = false; c.mode = 'tell'; c.pose = 'crouch'; c.tell = RC_T(T.tellS); c.tellKind = 'pounce'; c.tellX = L.x; c.tellZ = L.z; c.plan = []; rcFace(c, L.x - c.x, L.z - c.z); emit({ type: 'tell', cat: c.id, kind: 'pounce' }); return;
+        }
+        if (d > T.pounceR) c.hes = false; // a new approach may hesitate again
         const stalk = d <= T.stalkM; // inside stalkM the chase SLOWS to a stalk (low walk, eyes on the dot) before the crouch tell
         c.goal = 'chase'; c.mode = stalk ? 'stalk' : 'run'; c.pose = stalk ? 'walk' : 'run';
         if (walkOrDetour(c, L.x, L.z, stalk ? T.stalkV : c.lim.run, 'chase') === null) { c.mode = 'idle'; c.pose = 'stare'; c.t = RC_T(0.25); }
@@ -591,22 +610,32 @@ export function createRoomSession(opts = {}) {
   const rcPounceLand = (c) => {
     const L = s.laser, d = L && L.surf === c.surf ? rcLen(L.x - c.x, L.z - c.z) : Infinity;
     const moved = L ? rcLen(L.x - c.dotX0, L.z - c.dotZ0) : Infinity; // the dot's travel during the flight (from the launch): the escape
-    if (d <= T.catchR && moved <= T.escapeM) {
+    // GE1-B: a landed pounce can still FUMBLE (paw slips off the dot): chance fumbleP0 + dot speed x fumbleK (cap fumbleMax), seeded
+    const fumbled = d <= T.catchR && moved <= T.escapeM && prng.chance(Math.min(T.fumbleMax, T.fumbleP0 + rcDotSpeed(L) * T.fumbleK));
+    if (d <= T.catchR && moved <= T.escapeM && !fumbled) {
       emit({ type: 'pounce', cat: c.id, catch: true, d }); emit({ type: 'catch', cat: c.id, d }); c.played++;
       c.mode = 'pin'; c.pose = 'pin'; c.pin = RC_T(T.pinS); c.t = 0;
       if (s.comboCd <= 0 && rcCombo(s.combo, s.tick, T.comboN, RC_T(T.comboS))) { emit({ type: 'combo', n: T.comboN }); s.comboCd = RC_T(T.comboCdS); }
       return;
     }
-    emit({ type: 'pounce', cat: c.id, catch: false, d: d === Infinity ? -1 : d, escaped: d <= T.catchR });
+    emit({ type: 'pounce', cat: c.id, catch: false, d: d === Infinity ? -1 : d, escaped: d <= T.catchR, fumbled });
     if (d <= T.nearMissR) { const quiet = s.tick - c.nmTick < RC_T(T.nearMissCdS); if (!quiet) c.nmTick = s.tick; emit({ type: 'near_miss', cat: c.id, d, quiet }); }
     // a miss: the kitten lands, then stares ("lost it... found it!") for missStareS before the chase resumes
     c.pose = 'land'; c.t = RC_T(0.15); c.plan = [{ k: 'stare', n: RC_T(T.missStareS) }];
+    // GE1-B: ... and sometimes loses interest: sits watching the dot for boredS (the mute path) before it chases again
+    if (prng.chance(T.missBoredP)) c.mute = RC_T(T.boredS);
   };
   //: the tell ends. Pounce: aim at the dot where it is NOW (tell end), never further than pounceReach, always a legal
   // point of the cat's surface; the dot gone / off this surface = no pounce. Leap: run to the take-off point and hop.
   const rcTellEnd = (c) => {
     c.mode = 'idle'; c.tellKind === 'leap' ? rcLeapGo(c) : rcPounceGo(c);
     c.tellKind = null;
+  };
+  /** the dot's speed (m/s) over the ring (leadWinS; falls back to tellS when the ring is short); no allocation */
+  const rcDotSpeed = (L) => {
+    const k = (s.tick + 1) % s.laserHistN, oldOk = s.laserHS[k] === L.surf, win = oldOk ? (s.laserHistN - 1) * STEP_S : T.tellS;
+    if (!oldOk) return 0; // (a dot this surface has not seen for leadWinS: treat it as still; the escape rule covers a jump)
+    return rcLen(L.x - s.laserHX[k], L.z - s.laserHZ[k]) / win;
   };
   const rcPounceGo = (c) => {
     const L = s.laser;
@@ -615,11 +644,13 @@ export function createRoomSession(opts = {}) {
     // the dot's velocity over leadWinS (the ring; falls back to the tell when the ring has no dot on this surface that far back)
     const k = (s.tick + 1) % s.laserHistN, oldOk = s.laserHS[k] === L.surf, win = oldOk ? (s.laserHistN - 1) * STEP_S : T.tellS; // the oldest slot = leadWinS ago
     const ox = oldOk ? s.laserHX[k] : c.tellX, oz = oldOk ? s.laserHZ[k] : c.tellZ;
-    const vx = (L.x - ox) / win, vz = (L.z - oz) / win, trav = rcLen(vx, vz) * T.tellS, held = trav < T.leadDeadM;
+    const vx = (L.x - ox) / win, vz = (L.z - oz) / win, trav = rcLen(vx, vz) * T.aimErrS, held = trav < T.leadDeadM; // (GE1-B: aimErrS, not the longer tellS: the eyes track the dot through the whole crouch)
     const lead = held ? 0 : T.pounceLeadS, er = held ? 0 : trav * T.aimErr * Math.sqrt(prng.next()), ea = held ? 0 : prng.next() * 6.2831853; // (a held dot: no prng draw, aimed exactly)
     let ax = L.x, az = L.z;
     if (held) { let n = 0, sx = 0, sz = 0; for (let i = 0; i < T.heldMeanN; i++) { const q = (s.tick - i + s.laserHistN) % s.laserHistN; if (s.laserHS[q] !== L.surf) break; sx += s.laserHX[q]; sz += s.laserHZ[q]; n++; } if (n) { ax = sx / n + vx * (n - 1) / 2 * STEP_S; az = sz / n + vz * (n - 1) / 2 * STEP_S; } } // CM SHOULD: the mean lags a slow dot by (n-1)/2 steps; add that back // a held dot: aim at its recent MEAN (the jitter averages out; CK S1)
     let x = ax + vx * lead + er * Math.cos(ea), z = az + vz * lead + er * Math.sin(ea), d = rcLen(x - c.x, z - c.z);
+    // GE1-B: a STALE pounce commits to where the dot was when the tell started (no lead, no scatter): a dot that kept moving is missed
+    if (!held && prng.chance(T.staleP)) { x = c.tellX; z = c.tellZ; d = rcLen(x - c.x, z - c.z); }
     if (d > T.pounceReach) { const k = T.pounceReach / d; x = c.x + (x - c.x) * k; z = c.z + (z - c.z) * k; }
     if (!legalAt(c, x, z)) { x = L.x; z = L.z; d = rcLen(x - c.x, z - c.z); if (d > T.pounceReach) { const k = T.pounceReach / d; x = c.x + (x - c.x) * k; z = c.z + (z - c.z) * k; } if (!legalAt(c, x, z)) { x = c.x; z = c.z; } }
     c.dotX0 = L.x; c.dotZ0 = L.z; startHop(c, c.surf, x, c.y, z, 0.12, 'pounce'); c.cool = RC_T(T.pounceCdS);
