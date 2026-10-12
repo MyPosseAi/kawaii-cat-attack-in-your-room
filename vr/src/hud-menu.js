@@ -36,7 +36,9 @@
      visual = { open, hidden, active, pose: { c, r, u, n }, button: { p, hover, w, h }, tiles: [{ id, label, p, hover,
        active, disabled }], cursors: { left: p | null, right: p | null } }
    Build rule: only `export function` / `export const`; private names carry the `hm` / `HM_` prefix. */
-export const HUD_MENU_VERSION = 2; // 2 (GE2-B, the owner's Quest test 2026-10-11 petting): controller pet reach is a column over the kitten
+export const HUD_MENU_VERSION = 3; // 3 (Q-GE2, owner #7 + GO7 SHOULD 1): a Furniture tile opens a furniture picker page (same 7 tiles); the
+                                    // Laser tool's trigger always lights the laser (no pet-lock), the trigger pets only with the Pet tool.
+                                    // 2 (GE2-B, the owner's Quest test 2026-10-11 petting): controller pet reach is a column over the kitten
                                     // (petAboveM), a Laser trigger aimed AT a kitten pets her (lockR), pets pass the menu suppression unless that
                                     // source holds a menu press (latch)
 
@@ -57,7 +59,7 @@ export const HUD_TUNING = Object.freeze({
   beamM: 1.5, beamNearM: 0.1,       // the ray beam: to the hit point, else 1.5 m; shown while open or the ray is within 10 cm of the panel
   petNearM: 0.22,                   // a controller this close to a kitten's back pets it (any tool) ...
   petAboveM: 0.3,                   // ... or up to this much higher straight over her (a standing player's controller at ~0.65 m over a floor kitten)
-  lockR: 0.15,                      // Laser tool: a trigger press that STARTS with the ray this close to a kitten pets her for that hold (no dot)
+  lockR: 0.15,                      // (unused since v3: GO7 SHOULD 1 / owner, the Laser trigger always lights the laser; kept for old tuning objects)
   petRayR: 0.35, pickMaxM: 5,        // controller pet / grab: the nearest cat within 35 cm of the ray, up to 5 m
   callAheadM: 0.8,                   // "Call cats": a laser dot on the floor 0.8 m in front of the player while held
 });
@@ -69,12 +71,18 @@ export const HUD_ACTIONS = Object.freeze([
   Object.freeze({ id: 'toss', label: 'Grab + Toss', tip: 'Aim + hold to grab, let go to toss' }),
   Object.freeze({ id: 'call', label: 'Call cats', tip: 'Hold trigger / pinch: kittens come' }),
   Object.freeze({ id: 'laser_tag', label: 'Laser Tag', tip: 'Start a round', command: true }),
+  Object.freeze({ id: 'furniture', label: 'Furniture', tip: 'Place, move, turn or remove furniture', command: true }), // Q-GE2 (owner #7): opens the picker page
 ]);
 export const HUD_ACTION_IDS = Object.freeze(HUD_ACTIONS.map((a) => a.id));
+/** Q-GE2: the Furniture picker page (wand.js FURN_VR_PICKER: 6 pieces + Remove = as many tiles as the main page). Picking one
+ *  emits command 'furn:<kind>' (or 'furn:remove') and closes the menu; closing the menu always returns to the main page. */
+export const HUD_FURN_TILES = Object.freeze(FURN_VR_PICKER.map((t) => Object.freeze({ id: 'furn:' + t.id, label: t.label, command: true,
+  tip: t.id === 'remove' ? 'Remove the piece you touched last (or drop it on the bin)' : 'Grip / pinch it to move, twist or stick to turn' })));
 export const HUD_DEFAULT_ACTION = 'laser';
 export const HUD_CAPTIONS = Object.freeze({ menu_open: '(actions)', tool: '', blocked: 'Laser Tag: fill the Happiness meter first', command: '' });
 export const HAND_IDS = Object.freeze(['left', 'right']);
 const HM_BTN = 100, HM_NONE = -1;
+import { FURN_VR_PICKER } from './wand.js';
 
 function hmV() { return { x: 0, y: 0, z: 0 }; }
 function hmSet(o, x, y, z) { o.x = x; o.y = y; o.z = z; return o; }
@@ -99,8 +107,8 @@ export function createHudMenu(opts = {}) {
   const L = hudLayout(T);
   const tiles = HUD_ACTIONS.map((a, i) => ({ id: a.id, label: a.label, tip: a.tip, command: !!a.command, p: hmV(), hover: false, pressed: false, active: a.id === HUD_DEFAULT_ACTION, disabled: false, u: L.tiles[i].u, v: L.tiles[i].v }));
   const pose = { c: hmV(), r: hmSet(hmV(), 1, 0, 0), u: hmSet(hmV(), 0, 1, 0), n: hmSet(hmV(), 0, 0, 1) };
-  const visual = { open: false, hidden: false, active: HUD_DEFAULT_ACTION, pose, beams: { left: { show: false, o: hmV(), e: hmV() }, right: { show: false, o: hmV(), e: hmV() } }, hoverTip: '', button: { p: hmV(), hover: false, w: T.btnW, h: T.btnH }, tiles, cursors: { left: null, right: null }, placed: false };
-  const st = { T, L, open: false, active: opts.active && HUD_ACTION_IDS.includes(opts.active) ? opts.active : HUD_DEFAULT_ACTION, placed: false, following: false, opens: 0, selects: 0,
+  const visual = { page: 'main', open: false, hidden: false, active: HUD_DEFAULT_ACTION, pose, beams: { left: { show: false, o: hmV(), e: hmV() }, right: { show: false, o: hmV(), e: hmV() } }, hoverTip: '', button: { p: hmV(), hover: false, w: T.btnW, h: T.btnH }, tiles, cursors: { left: null, right: null }, placed: false };
+  const st = { page: 'main', T, L, open: false, active: opts.active && HUD_ACTION_IDS.includes(opts.active) ? opts.active : HUD_DEFAULT_ACTION, placed: false, following: false, opens: 0, selects: 0,
     src: { left: hmSrcState(), right: hmSrcState() }, events: [], haptics: [], _evPool: hmEvPool(16), _hPool: [{ hand: '', strength: 0, ms: 0 }, { hand: '', strength: 0, ms: 0 }, { hand: '', strength: 0, ms: 0 }, { hand: '', strength: 0, ms: 0 }],
     _nEv: 0, _nH: 0, _toggled: false, closeAt: -1, picked: -1, _t: 0, _k: 0.5, _probe: { lu: 0, lv: 0 }, suppress: { left: { all: false, pinch: false }, right: { all: false, pinch: false } }, visual, _out: null,
     gest: { left: hmGestPool(), right: hmGestPool() }, live: { left: false, right: false }, toolOut: [], filtOut: [] };
@@ -201,7 +209,13 @@ function hmToggle(st, head) { if (st._toggled) return; st._toggled = true; hmSet
 function hmSetOpen(st, open, head) {
   if (open === st.open) return;
   st.open = open; st.visual.open = open;
-  if (open) { st.opens++; if (head && (!st.placed || hmOff(st, head))) hmPlace(st, head, 1); hmEmit(st, 'menu_open'); } else { st.closeAt = -1; st.picked = -1; hmEmit(st, 'menu_close'); } // coach MUST 4: no jump under the pointer
+  if (open) { st.opens++; if (head && (!st.placed || hmOff(st, head))) hmPlace(st, head, 1); hmEmit(st, 'menu_open'); } else { st.closeAt = -1; st.picked = -1; if (st.page === 'furniture') hmFurnPage(st, false); hmEmit(st, 'menu_close'); } // coach MUST 4: no jump under the pointer
+}
+/** Q-GE2: show the Furniture picker page (on) or the main actions (off) on the same tile objects */
+function hmFurnPage(st, on) {
+  const list = on ? HUD_FURN_TILES : HUD_ACTIONS, tiles = st.visual.tiles;
+  for (let i = 0; i < tiles.length; i++) { const a = list[i] || null, t = tiles[i]; t.id = a ? a.id : ''; t.label = a ? a.label : ''; t.tip = a ? a.tip : ''; t.command = !!(a && a.command); t.active = !on && t.id === st.active; t.hover = false; }
+  st.page = on ? 'furniture' : 'main'; st.visual.page = st.page;
 }
 function hmPick(st, hand, s, idx, input) {
   if (idx === HM_BTN) { hmToggle(st, input.head); hmHaptic(st, hand, st.T.clickHaptic, st.T.clickMs); return; }
@@ -210,6 +224,7 @@ function hmPick(st, hand, s, idx, input) {
   hmHaptic(st, hand, st.T.clickHaptic, st.T.clickMs);
   st.selects++;
   hmEmit(st, 'select', hand, '', tile.id);
+  if (tile.id === 'furniture') { hmFurnPage(st, true); return; } // the picker opens in place: the menu stays open
   if (tile.command) hmEmit(st, 'command', hand, '', tile.id);
   else if (tile.id !== st.active) { st.active = tile.id; for (const t of st.visual.tiles) t.active = t.id === st.active; st.visual.active = st.active; hmEmit(st, 'tool', hand, '', tile.id); }
   if (st.T.closeOnSelect) { st.closeAt = st._t + st.T.closeS; st.picked = idx; }
@@ -359,11 +374,8 @@ export function hudToolEvents(st, hand, src, ctx) {
     if (bi >= 0) best = c.targets[bi];
     if (best && !(want && (tool === 'pet' || s.petLock))) { const e = g.pet; e.hand = hand; e.p.x = best.x; e.p.y = best.y; e.p.z = best.z; out[n++] = e; }
   }
-  // Laser tool: a trigger that STARTS aimed at a kitten pets her for that hold (Meta: lock the target at selectstart)
-  if (want && !s.toolOn && isCtl && tool === 'laser' && !c.forceLaser && c.targets) {
-    const cat = hudPickCat(c.targets, src.ray, T, T.lockR);
-    if (cat) { s.toolOn = true; s.tool = 'pet'; s.petLock = true; s.petId = cat.id == null ? null : cat.id; n = hmToolHold(st, hand, src, c, out, n); out.length = n; return out; }
-  }
+  // GO7 SHOULD 1 (Q-GE2, owner): no pet-lock for the Laser tool any more: its trigger ALWAYS lights the laser (the natural lure beside a
+  // kitten works); the trigger pets only with the Pet tool. Holding the controller at a kitten's back (above) pets with any tool.
   if (want && !s.toolOn) { s.toolOn = true; s.tool = tool; s.petLock = false; s.petId = null; n = hmToolStart(st, hand, src, c, out, n); }
   else if (want && s.toolOn && (s.tool === tool || s.petLock)) n = hmToolHold(st, hand, src, c, out, n);
   else if (s.toolOn) { n = hmToolEnd(st, hand, src, c, out, n); s.toolOn = false; s.petLock = false; s.petId = null; if (want) { s.toolOn = true; s.tool = tool; n = hmToolStart(st, hand, src, c, out, n); } }

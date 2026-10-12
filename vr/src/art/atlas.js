@@ -24,9 +24,19 @@ export const ANIM_ALIAS = Object.freeze({
   purr: 'purr', petted: 'purr', loaf: 'purr',
   sleep: 'sleep', nap: 'sleep',
   // roomcat v5 idle cycle (owner's Quest test 2026-10-10 fixes): no groom / stretch art yet -> nearest existing frames
-  groom: 'sit', stretch: 'pounce:hold0', pause: 'idle',
+  // Q-GE2 (brief B 4/7): stretch is the idle frame + cat-billboard's procedural play-bow, never the crouch (pounce frame 0)
+  groom: 'sit', stretch: 'idle', pause: 'idle',
 });
 const RUN_FPS_X = 1.8; // run / trot / fall play the walk cycle faster when no speed is given
+/** Q-GE2 (brief B A1, scurry fix): the walk cycle's rate follows the cat's real speed, clamped to 0.6-2.5x the base fps,
+ *  so a 0.35 m/s kitten no longer plays ~39 fps and a 0.9 m/s run never aliases past 2.5x */
+export const WALK_FPS_X_MIN = 0.6, WALK_FPS_X_MAX = 2.5;
+export function walkFpsScale(speedMps, noSlideMps) {
+  const v = Number(speedMps), ns = Number(noSlideMps);
+  if (!(v > 0) || !(ns > 0)) return 1;
+  const k = v / ns;
+  return k < WALK_FPS_X_MIN ? WALK_FPS_X_MIN : k > WALK_FPS_X_MAX ? WALK_FPS_X_MAX : k;
+}
 
 /** fetch + parse the manifest (fetchFn for tests / custom loaders). Same origin only: the art ships with the build. */
 export async function loadManifest(url, fetchFn) {
@@ -71,7 +81,9 @@ export function createAtlas(manifest, opt) {
     return [...out];
   }
   /**
-   * One frame. t = seconds since this anim started. opt: { lod, flipX, speedMps (walk), holdFirstS (pounce stalk), viewName }.
+   * One frame. t = seconds since this anim started. opt: { lod, flipX, speedMps (walk), holdFirstS (pounce stalk), viewName,
+   * cycleT }. cycleT (Q-GE2): the host's own speed-integrated clock (sum of dt * fpsScale) in base-fps seconds; when finite it
+   * replaces t * speed scaling, so an easing speed never jumps frames (frame = floor(cycleT * base fps)).
    * Returns null for an unknown cat.
    */
   function getFrame(catId, view, anim, t, fo) {
@@ -81,11 +93,9 @@ export function createAtlas(manifest, opt) {
     let a = ANIM_ALIAS[anim] || 'idle'; const hold0 = a.endsWith(':hold0'); a = a.replace(':hold0', '');
     const list = M.cats[cat].frames[v][a], n = list.length, spec = M.anims[a];
     let fps = spec.fps[v] || 1;
-    if (a === 'walk') {
-      if (fo.speedMps > 0 && spec.noSlideMps) fps *= fo.speedMps / spec.noSlideMps;
-      else if (anim === 'run' || anim === 'trot' || anim === 'fall') fps *= RUN_FPS_X;
-    }
-    const tt = Math.max(0, Number(t) || 0);
+    const cyc = a === 'walk' && Number.isFinite(fo.cycleT); // walk only: other anims keep t
+    if (a === 'walk' && !cyc) fps *= fpsScaleOf(anim, a, spec, fo.speedMps);
+    const tt = Math.max(0, cyc ? fo.cycleT : (Number(t) || 0));
     let idx, done = false;
     if (hold0) idx = 0;
     else if (spec.loop) idx = Math.floor(tt * fps) % n;
@@ -102,6 +112,17 @@ export function createAtlas(manifest, opt) {
       sizeM: [w / L.ppm, h / L.ppm], centerM: [flipX ? -cx : cx, cy], liftM: fr.liftM || 0,
       fell: { view: fellView, anim: !M.anims[anim] },
     };
+  }
+  /** walk-rate multiplier for a roomcat pose at a speed (1 for non-walk anims): run / trot / fall without a speed = RUN_FPS_X */
+  function fpsScaleOf(anim, a, spec, speedMps) {
+    if (a !== 'walk') return 1;
+    if (speedMps > 0 && spec.noSlideMps) return walkFpsScale(speedMps, spec.noSlideMps);
+    return anim === 'run' || anim === 'trot' || anim === 'fall' ? RUN_FPS_X : 1;
+  }
+  /** Q-GE2: the host integrates cycleT += dt * fpsScale(pose, speed) per kitten (no allocation) */
+  function fpsScale(anim, speedMps) {
+    let a = ANIM_ALIAS[anim] || 'idle'; a = a.replace(':hold0', '');
+    return fpsScaleOf(anim, a, M.anims[a] || {}, speedMps);
   }
   /** GE2 adapter for createSpriteCache({ draw }): draw frame f (from getFrame) out of its loaded atlas image into a px x px
    *  canvas that spans spanM metres (default 0.5), the floor point / body centre at (px / 2, 0.85 px). Same scale every frame. */
@@ -127,5 +148,5 @@ export function createAtlas(manifest, opt) {
     const [x, y, w, h] = f.r;
     return { file: B.atlas.file, rect: f.r, uv: { u0: x / B.atlas.w, v0: 1 - (y + h) / B.atlas.h, u1: (x + w) / B.atlas.w, v1: 1 - y / B.atlas.h } };
   }
-  return { version: ATLAS_VERSION, manifest: M, cats: () => ids.slice(), resolveCat, getFrame, drawFrame, files, sheetFiles, gpuBytes, boxFace, lodInfo };
+  return { version: ATLAS_VERSION, manifest: M, cats: () => ids.slice(), resolveCat, getFrame, fpsScale, drawFrame, files, sheetFiles, gpuBytes, boxFace, lodInfo };
 }

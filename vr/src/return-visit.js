@@ -15,7 +15,7 @@
    touched), readMemory reads that map, and writeMemoryRecord / readMemoryRecord refuse (Code Review L W4 SHOULD 1).
    Build rule: only `export function` / `export const`; private names carry the `rv` prefix. */
 import { heartsFor } from './end-card.js';
-import { VISIT_STORE_KEY, KITTEN_MEMORY_PERSIST, MEMORY_KINDS, MEMORY_LABELS, MEMORY_LIMITS, sanitizeMemoryFields, memoryLabel, readVisit } from './visit-store.js';
+import { VISIT_STORE_KEY, KITTEN_MEMORY_PERSIST, MEMORY_KINDS, MEMORY_LABELS, MEMORY_LIMITS, sanitizeMemoryFields, memoryLabel, readVisit, carriedFurniture } from './visit-store.js';
 export { KITTEN_MEMORY_PERSIST, MEMORY_KINDS, MEMORY_LABELS };
 
 export const RETURN_VISIT_VERSION = 1;
@@ -138,7 +138,8 @@ export function writeMemoryRecord(storage, memory, roster, key, gate) {
     if (!storage || typeof storage.setItem !== 'function') return false;
     const visit = readVisit(storage, k);
     const clean = sanitizeMemory(memory, roster);
-    const rec = Object.assign({ v: 1 }, visit ? { day: visit.day, visit: visit.visit } : {}, { memory: clean });
+    const furniture = carriedFurniture(storage, k); //: the furniture field rides along (whitelisted) only while FURNITURE_PERSIST
+    const rec = Object.assign({ v: 1 }, visit ? { day: visit.day, visit: visit.visit } : {}, { memory: clean }, furniture ? { furniture } : {});
     storage.setItem(k, JSON.stringify(rec));
     const back = readMemoryRecord(storage, roster, k, open);
     return JSON.stringify(back) === JSON.stringify(clean) && (!visit || JSON.stringify(readVisit(storage, k)) === JSON.stringify(visit));

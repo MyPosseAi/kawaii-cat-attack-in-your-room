@@ -21,7 +21,7 @@ import { createRoomSession, ROOMCAT_SIZES, ROOMCAT_TUNING } from '../../game/cor
 import { createFixedLoop, STEP_MS } from '../../game/core/loop.js';
 import { createGestureState, gestureStep, JOINTS } from './gestures.js';
 import { pickCatView, billboardYaw } from './cat-views.js';
-import { placeBasket, createWandState, wandStep, wandView } from './wand.js';
+import { placeBasket, createWandState, wandStep, wandView, createFurnitureState, furnitureAdd, furnitureRemove, furnitureStep, furnitureMeshes, furnitureFloor, furnitureRugFrame, furnitureSave, furnitureRestore } from './wand.js';
 import { createProgress, progressStep, createHintState, hintStep, soundCues, createCaptionState, captionStep } from './hints.js';
 import { buildEndCard, endCardDue } from './end-card.js';
 import { rememberSession, spotsForRoom } from './return-visit.js';
@@ -302,7 +302,8 @@ export function catBackPoint(c) {
 /**
  * roomcat state -> billboard records. camera = head { x, y, z }; prevViews = { [catId]: view } from the last frame
  * (hysteresis). Returns { cats: [...], views: { [id]: view } }. Each cat: { id, x, y, z, yaw, view, sprite, flipX,
- * rotDeg, tiltDeg, pose, mode, poof, purr, airborne, size, shadow: { y, alpha } | null }.
+ * rotDeg, tiltDeg, pose, mode, poof, purr, airborne, size, shadow: { y, alpha } | null, speed (m/s, eased; NaN if the state
+ * has none), tell ({ phase, n, s } | null, the state's own object), stalk ('freeze' | 'burst' | null) } (Q-GE2 gait render).
  * The contact shadow sits on the surface straight below the cat (ray down over the room's horizontal surfaces), so a
  * hopping / carried cat still casts on the floor or table under it (no-hover). Over nothing = no shadow.
  */
@@ -326,6 +327,7 @@ export function catsToBillboards(state, room, camera, prevViews) {
       id: c.id, size: c.size, x: c.x, y: c.y, z: c.z, yaw: billboardYaw(c, camera),
       view: pv.view, sprite: pv.sprite, flipX: pv.flipX, rotDeg: pv.rotDeg, tiltDeg: pv.tiltDeg,
       pose: c.pose, mode: c.mode, poof: !!c.poof, purr: !!c.purr, airborne: !!c.airborne, bond: c.bond, shadow,
+      speed: Number.isFinite(c.speed) ? c.speed : NaN, tell: c.tell || null, stalk: c.stalk || null,
     });
   }
   return { cats, views };
@@ -425,7 +427,10 @@ export function readHands(frame, refSpace, t, scratch) {
 // ---------------------------------------------------------------- 4. runtime
 
 /**
- * createRoomBridge({ seed, cats, size, arc, onLog, tuning, roster, visit, names, persisted, leftHanded, memory }) -> bridge.
+ * createRoomBridge({ seed, cats, size, arc, onLog, tuning, roster, visit, names, persisted, leftHanded, memory, furniture, saveFurniture }) -> bridge.
+ *   furniture = the saved furniture (visit-store.js readFurniture, whitelisted): put on the PLAY RUG's cells at the
+ *   first start() whose room has the play rug; saveFurniture(f) (optional) is called with wand.js furnitureSave whenever the
+ *   rug list changes and no piece is held (scanned room = no rug = never called).
  *   memory = the kitten memory loaded by the host (return-visit.js readMemory): remembered kittens head to their favourite
  *   spot at nap time; with the end card the result carries `memory` = the memory to save (rememberSession).
  *   bridge.observe(scene, viewer, forward, floorY, t)   every frame BEFORE start(): collects the scene; sets bridge.ready
@@ -457,7 +462,10 @@ export function createRoomBridge(opts = {}) {
     seated: null, _gr: { left: null, right: null }, _pinchP: { left: { x: 0, y: 0, z: 0, ok: false }, right: { x: 0, y: 0, z: 0, ok: false } },
     _rayPet: { left: null, right: null }, _sq: { left: null, right: null }, _sel: { left: false, right: false }, _sqWas: { left: false, right: false },
     _hapT: { left: -Infinity, right: -Infinity }, _hapPool: [{ hand: '', strength: 0, ms: 0 }, { hand: '', strength: 0, ms: 0 }], petHaptics: [], _tapped: false,
-    tip: createTipCard(), _tipLines: [],
+    tip: createTipCard(), _tipLines: [], _tipIn: { t: 0, dt: 0, text: '', head: null, gaze: null, tap: false, menuOpen: false, leftHanded: false }, _tipA: null, _tipB: null, _tipText: '',
+    // Q-GE2 (owner #7): virtual furniture (wand.js); the pieces live for the page (carried into the next session's room build) and,
+    //, their PLAY RUG cells are saved through opts.saveFurniture (visit-store.js writeFurniture, gate FURNITURE_PERSIST)
+    furn: null, _furnPieces: [], _rugFrame: null, _furnRestored: false, _furnSavedV: -1, _furnSavedJ: null, _fev: { type: '', hand: '', p: null, ray: null, yaw: NaN, x: 0, dt: 0 }, _seatAt: { x: 0, y: 0, z: 0 }, _down: { o: { x: 0, y: 0, z: 0 }, d: { x: 0, y: -1, z: 0 } },
   };
   for (const h of T.hands) b.gestures[h] = createGestureState(h);
 
@@ -493,6 +501,7 @@ export function createRoomBridge(opts = {}) {
   /** the room + the deterministic session for the LAST observed scene (pure of bridge state: observe() prebuilds, start() applies) */
   function buildRoomAndSession(sig) {
     const input = buildRoomInput(b._lastScene || { planes: [], meshes: [] }, b._lastViewer, b._lastForward, b._lastFloorY);
+    if (b._furnPieces.length) for (const m of furnitureMeshes({ pieces: b._furnPieces }, input.floorY)) input.meshes.push(m); // Q-GE2: placed furniture = surfaces / obstacles for the cats
     const room = createRoom(input);
     // W4 kitten memory (return-visit.js): a remembered kitten heads to its favourite spot in THIS room (matched by label)
     let cats = opts.cats == null ? 3 : opts.cats;
@@ -517,6 +526,14 @@ export function createRoomBridge(opts = {}) {
     b.state = b.session.state();
     b.time = 0; b.progress = createProgress(); b.hints = createHintState(); b.captions = createCaptionState(); b.hint = null; b.caption = null; b.endCard = null; b.memory = null; b._prevState = null;
     b.wand = createWandState(placeBasket(b.room, input.viewer, input.forward, input.floorY, !!opts.leftHanded));
+    { // Q-GE2: the furniture bin sits on the floor on the side away from the toy basket, a little ahead; the pieces carry over
+      const f = input.forward, fl = Math.hypot(f.x, f.z) || 1, fx = f.x / fl, fz = f.z / fl, side = opts.leftHanded ? -1 : 1; // left of forward = (fz, -fx)
+      b.furn = createFurnitureState({ bin: { x: input.viewer.x + fz * 0.5 * side + fx * 0.35, y: input.floorY, z: input.viewer.z - fx * 0.5 * side + fz * 0.35 }, floor: furnitureFloor(b.room) });
+      for (const p of b._furnPieces) { p.held = null; b.furn.pieces.push(p); b.furn.seq = Math.max(b.furn.seq, Number(String(p.id).slice(2)) || 0); }
+      b._rugFrame = furnitureRugFrame(b.room); // the play rug only (null in a scanned room: nothing saved / restored there)
+      if (b._rugFrame && !b._furnRestored) { b._furnRestored = true; if (!b.furn.pieces.length && opts.furniture) furnitureRestore(b.furn, opts.furniture, b._rugFrame, input.floorY); }
+      b._furnPieces = b.furn.pieces; b._furnSavedV = b.furn.version; b._furnSavedJ = null;
+    }
     b.director = createDirector({ room: b.room, seed: opts.seed == null ? 1 : opts.seed, viewer: input.viewer, forward: input.forward });
     b.fx = createFx(opts.seed == null ? 1 : opts.seed);
     b.hud = createHudMenu(); b._laserGate = createLaserGate(); // SK-HUD: a fresh menu per session (tool = Laser)
@@ -569,6 +586,10 @@ export function createRoomBridge(opts = {}) {
       b._hudEnabled.laser_tag = D.mode === 'offer' || D.mode === 'scorecard';
       hm = hudMenuStep(b.hud, { t: b.time, dt, head: b._hudHead, sources: srcs, hide: !!b.endCard || !!hudIn.hide, wristToggle: !!hudIn.wristToggle, enabled: b._hudEnabled });
       for (const e of hm.events) if (e.type === 'command' && e.action === 'laser_tag' && (D.mode === 'offer' || D.mode === 'scorecard')) startLaserTag(D);
+      for (const e of hm.events) if (e.type === 'command' && b.furn && e.action.startsWith('furn:')) { // Q-GE2: the Furniture picker
+        const k = e.action.slice(5);
+        if (k === 'remove') furnitureRemove(b.furn); else furnitureAdd(b.furn, k, { viewer: camera, forward: fwd, floorY: b.roomInput ? b.roomInput.floorY : 0 });
+      }
       const tc = b._hudTctx; tc.forceLaser = route === 'lt'; tc.head = b._hudHead; // GO1 SHOULD 1: in Laser Tag the controller trigger aims the dot whatever the tool
        tc.floorY = b.roomInput ? b.roomInput.floorY : 0; tc.targets = targets; tc.dt = dt;
       tc.grabs = b.state && b.hud.active === 'toss' ? b.state.cats.filter((c) => c.mode !== 'inbox' && c.mode !== 'carried').map((c) => ({ x: c.x, y: c.y + (ROOMCAT_SIZES[c.size] || ROOMCAT_SIZES.kitten).scruff, z: c.z })) : null;
@@ -601,12 +622,18 @@ export function createRoomBridge(opts = {}) {
         b.wand = w.state;
         for (const we of w.events) events.push(we);
         if (w.consumed) continue;
+        // Q-GE2: then the furniture: a pinch at a piece (not at a kitten's scruff / the box lid) grabs it; that hand's moves drag it
+        if (b.furn && (ev.type === 'pinch_start' ? !grabbable(ev.p) : b.furn.held[h] && (ev.type === 'move' || ev.type === 'pinch_hold' || ev.type === 'pinch_release' || ev.type === 'lost'))) {
+          const fe = b._fev; fe.type = ev.type; fe.hand = h; fe.p = ev.p || null; fe.ray = null; fe.yaw = handYaw(byHand[h]);
+          if (furnitureStep(b.furn, fe, null).consumed && (ev.type === 'pinch_start' || ev.type === 'pinch_release')) continue;
+        }
         // GE2-B: a hand pinch that grabs nothing (no scruff / box lid near) with the hand ray on a kitten pets her while it holds
         if (ev.type === 'pinch_start' && srcs && srcs[h] && srcs[h].kind === 'hand' && !grabbable(ev.p)) { const c = hudPickCat(targets, srcs[h].ray, null, T.rayPetR); b._rayPet[h] = c ? c.id : null; }
         for (const re of gestureToRoomEvents(ev, ctx)) events.push(re); // the Play laser stays live while Laser Tag is offered (review BB S1): the floor ring is the start target
       }
     }
     if (route !== 'lt') handExtras(targets, srcs, events);
+    furnSaveCheck();
     const simEvents = b.simEvents; simEvents.length = 0;
     const n = b.loop.advance(dt * 1000);
     let bb;
@@ -674,10 +701,14 @@ export function createRoomBridge(opts = {}) {
     if (b.hint && b.hint.text) tl.push(b.hint.text);
     if (b.caption) tl.push(b.caption);
     if (srcs) for (const h of T.hands) { const sc = srcs[h], on = !!(sc && (sc.select || sc.squeeze)); if (on && !b._sel[h]) b._tapped = true; b._sel[h] = on; }
-    const tipCard = tipCardStep(b.tip, { t: b.time, dt, text: tl.join('\n'), head: camera || null, gaze: gaze || null, tap: b._tapped, menuOpen: !!(hm && hm.visual.open), leftHanded: !!opts.leftHanded });
+    // GO7 SHOULD 2: the tip-card input is one reused object and the text is joined only when a line changed (strings compare by value)
+    const ta = tl.length > 0 ? tl[0] : null, tb = tl.length > 1 ? tl[1] : null;
+    if (ta !== b._tipA || tb !== b._tipB) { b._tipA = ta; b._tipB = tb; b._tipText = tl.join('\n'); }
+    const ti = b._tipIn; ti.t = b.time; ti.dt = dt; ti.text = b._tipText; ti.head = camera || null; ti.gaze = gaze || null; ti.tap = b._tapped; ti.menuOpen = !!(hm && hm.visual.open); ti.leftHanded = !!opts.leftHanded;
+    const tipCard = tipCardStep(b.tip, ti);
     const dir = { mode: dmode, route, meter: D.meter.value, meterFull: D.meter.full, celebrate: D.celebrate, scorecard: D.scorecard, hud: D.hud, dot: route === 'lt' ? dotNow : null, ring: offerRing(D), best: D.best, round: D.ltRound };
     const hud = hm ? { visual: hm.visual, events: hm.events, haptics: hm.haptics, stats: hudStats(dir, b.state, b.hud.active) } : null;
-    return { cats: bb.cats, views: bb.views, state: b.state, events, simEvents, wand: route === 'lt' ? null : wandView(b.wand), hint: b.hint, hintChanged, caption: b.caption, captionChanged: cr.changed, endCard: b.endCard, memory: b.memory, fx: b.fx, director: dir, hud, tipCard, petHaptics: b.petHaptics, seated: b.seated };
+    return { cats: bb.cats, views: bb.views, state: b.state, events, simEvents, wand: route === 'lt' ? null : wandView(b.wand), hint: b.hint, hintChanged, caption: b.caption, captionChanged: cr.changed, endCard: b.endCard, memory: b.memory, fx: b.fx, director: dir, hud, tipCard, petHaptics: b.petHaptics, seated: b.seated, furniture: route === 'lt' ? null : b.furn };
   };
 
   // ---------------------------------------------------------------- GE2-B helpers (closures over b / T)
@@ -714,7 +745,7 @@ export function createRoomBridge(opts = {}) {
     return true;
   }
   /** a pet room event at kitten `id`'s back (the point roomcat measures petR from) */
-  function petAt(events, hand, id) { const c = catOf(id); if (!c) return false; const q = catBackPoint(c); events.push({ type: 'pet', hand, p: { x: q.x, y: q.y, z: q.z } }); return true; }
+  function petAt(events, hand, id) { const c = catOf(id); if (!c) return false; events.push({ type: 'pet', hand, p: catBackPoint(c) }); return true; } // (one fresh object pair: roomcat LOGS the event by reference, so it is never reused)
   function rumble(hand) {
     const srcs = b._srcs; if (!srcs || !srcs[hand] || srcs[hand].kind === 'hand') return; // hands have no actuator
     if (b.time - b._hapT[hand] < T.petHapEveryS - 1e-9) return;
@@ -725,6 +756,8 @@ export function createRoomBridge(opts = {}) {
   /** after the gesture events: distance pets, controller grip (squeeze), the seat (virtual carrier moves, set-down), pets on a seated kitten, rumble */
   function handExtras(targets, srcs, events) {
     b._srcs = srcs;
+    // Q-GE2: a held piece turns with the thumbstick (main.js sources[h].stickX)
+    if (srcs && b.furn) for (const h of T.hands) { const sc = srcs[h]; if (sc && b.furn.held[h] && Number.isFinite(sc.stickX)) { const fe = b._fev; fe.type = 'rotate'; fe.hand = h; fe.x = sc.stickX; fe.dt = dt0; furnitureStep(b.furn, fe, null); } }
     const seat = b.seated;
     // 1. the seat's carrier hand no longer drives her: its own moves / pinches / releases are dropped (she follows the palm / controller)
     if (seat) {
@@ -742,9 +775,12 @@ export function createRoomBridge(opts = {}) {
         let best = null, bd = T.sqGrabM * T.sqGrabM;
         if (!b.seated && b.state) for (const c of b.state.cats) { if (c.mode === 'inbox' || c.mode === 'carried' || c.sulk) continue; const dx = grip.x - c.x, dy = grip.y - (c.y + sizeOf(c).scruff), dz = grip.z - c.z, d2 = dx * dx + dy * dy + dz * dz; if (d2 <= bd) { bd = d2; best = c; } }
         if (best) { const q = { x: best.x, y: best.y + sizeOf(best).scruff, z: best.z }; events.push({ type: 'pinch', hand: h, p: q }); b.seated = { cat: best.id, carrier: h, support: h, kind: 'ctl', lost: null, since: b.time, down: null, purrUntil: -Infinity, nextPurr: -Infinity }; b._sq[h] = 'grab'; }
+        else if (b.furn && furnStep(h, 'grab_start', sc, grip).consumed) b._sq[h] = 'furn'; // Q-GE2: grip at a piece (or its ray on one) grabs it
         else { const c = hudPickCat(targets, sc.ray, null, T.rayPetR); b._sq[h] = c ? c.id : null; }
-      } else if (sq && b._sq[h] != null && b._sq[h] !== 'grab') { if (!petAt(events, h, b._sq[h])) b._sq[h] = null; }
-      else if (!sq && was) { if (b._sq[h] === 'grab' && b.seated && b.seated.kind === 'ctl' && b.seated.carrier === h) setDown(); b._sq[h] = null; }
+      } else if (sq && b._sq[h] === 'furn') { if (!b.furn || !b.furn.held[h]) b._sq[h] = null; else furnStep(h, 'grab_move', sc, grip); }
+      else if (sq && b._sq[h] != null && b._sq[h] !== 'grab') { if (!petAt(events, h, b._sq[h])) b._sq[h] = null; }
+      else if (!sq && was) { if (b._sq[h] === 'grab' && b.seated && b.seated.kind === 'ctl' && b.seated.carrier === h) setDown(); if (b._sq[h] === 'furn' && b.furn && b.furn.held[h]) furnStep(h, 'grab_end', sc, grip); b._sq[h] = null; }
+      else if (!sc && b.furn && b.furn.held[h] && b._sq[h] === 'furn') { const fe = b._fev; fe.type = 'lost'; fe.hand = h; furnitureStep(b.furn, fe, null); b._sq[h] = null; } // controller gone: dropped where it is
     }
     // 4. the seat: she follows the palm / controller; a palm turned over or gone (seatLostS), or seatMaxS, sets her down gently
     const st = b.seated;
@@ -755,9 +791,9 @@ export function createRoomBridge(opts = {}) {
         const sz = sizeOf(c);
         if (!st.down) {
           let at = null;
-          if (st.kind === 'palm') { const palm = openPalm(st.support, false); if (palm) at = { x: palm.x, y: palm.y + T.seatLift, z: palm.z }; }
-          else { const sc = srcs && srcs[st.support], g = sc && (sc.grip || (sc.ray && sc.ray.o)); if (g) at = { x: g.x, y: g.y + T.ctlSeatLift, z: g.z }; }
-          if (at) { st.lost = null; st.at = at; } else if (st.lost == null) st.lost = b.time;
+          if (st.kind === 'palm') { const palm = openPalm(st.support, false); if (palm) { at = b._seatAt; at.x = palm.x; at.y = palm.y + T.seatLift; at.z = palm.z; } }
+          else { const sc = srcs && srcs[st.support], g = sc && (sc.grip || (sc.ray && sc.ray.o)); if (g) { at = b._seatAt; at.x = g.x; at.y = g.y + T.ctlSeatLift; at.z = g.z; } }
+          if (at) { st.lost = null; st.at = at; } else if (st.lost == null) { st.lost = b.time; if (st.at) st.at = { x: st.at.x, y: st.at.y, z: st.at.z }; } // (the last seen spot is kept by value once lost)
           if ((st.lost != null && b.time - st.lost >= T.seatLostS) || b.time - st.since > T.seatMaxS) setDown();
           else { const a = st.at || { x: c.x, y: c.y, z: c.z }; events.push({ type: 'move', hand: st.carrier, p: { x: a.x, y: a.y + sz.scruff, z: a.z } }); }
         }
@@ -791,11 +827,26 @@ export function createRoomBridge(opts = {}) {
     if (srcs) for (let i = 0; i < events.length; i++) { const e = events[i]; if (e.type === 'pet' && e.hand && srcs[e.hand] && srcs[e.hand].kind === 'controller') rumble(e.hand); }
   }
   let dt0 = 0;
+  /** Q-GE2: a controller grip event for the furniture (scratch event: p = the grip, the ray, yaw = the ray heading) */
+  /**: hand the rug list to the host when it changed and nothing is held (only when the save JSON differs). */
+  function furnSaveCheck() {
+    const F = b.furn; if (!F || !b._rugFrame || typeof opts.saveFurniture !== 'function' || F.version === b._furnSavedV || F.held.left || F.held.right) return;
+    b._furnSavedV = F.version;
+    const f = furnitureSave(F, b._rugFrame), j = JSON.stringify(f);
+    if (j === b._furnSavedJ) return;
+    if (b._furnSavedJ === null && !F.pieces.length && !opts.furniture) { b._furnSavedJ = j; return; } // nothing placed yet: no write
+    b._furnSavedJ = j;
+    try { opts.saveFurniture(f); } catch (e) { /* storage problems never stop play */ }
+  }
+  function furnStep(h, type, sc, grip) { const fe = b._fev; fe.type = type; fe.hand = h; fe.p = grip || null; fe.ray = sc ? sc.ray : null; fe.yaw = sc && sc.ray ? Math.atan2(sc.ray.d.x, sc.ray.d.z) : NaN; return furnitureStep(b.furn, fe, null); }
+  /** Q-GE2: a tracked hand's heading (wrist -> middle knuckle on the floor plane): turning the hand twists a held piece */
+  function handYaw(s) { const j = s && s.joints, w = j && j.wrist, m = j && j['middle-finger-metacarpal']; if (!w || !m) return NaN; const dx = m.x - w.x, dz = m.z - w.z; return dx * dx + dz * dz > 1e-6 ? Math.atan2(dx, dz) : NaN; }
   /** start lowering the seated kitten to the surface under her (then let go 2 cm over it: no drop, no toss) */
   function setDown() {
     const st = b.seated; if (!st || st.down) return;
     const c = catOf(st.cat); if (!c) { b.seated = null; return; }
-    const hit = b.room ? roomRaycast(b.room, { x: c.x, y: c.y + 0.01, z: c.z }, { x: 0, y: -1, z: 0 }) : null;
+    const r = b._down; r.o.x = c.x; r.o.y = c.y + 0.01; r.o.z = c.z;
+    const hit = b.room ? roomRaycast(b.room, r.o, r.d) : null;
     const yEnd = (hit ? hit.y : (b.roomInput ? b.roomInput.floorY : 0)) + 0.02;
     st.down = { x: c.x, y: Math.max(c.y, yEnd), z: c.z, yEnd };
   }

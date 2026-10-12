@@ -23,7 +23,7 @@ import { createCatBillboard } from './cat-billboard.js';
 import { createRoomHook } from './room-hook.js';
 import { inputKinds, readHands, readWebXRScene } from './room-bridge.js';
 import { createSessionLife } from './session-life.js';
-import { beginVisit } from './visit-store.js';
+import { beginVisit, readFurniture, writeFurniture } from './visit-store.js';
 import { readMemory, writeMemory } from './return-visit.js';
 import { rosterForVisit } from './end-card.js';
 import { log } from './log.js';
@@ -49,8 +49,12 @@ function startVisit() {
   const memory = readMemory(visitStorage(), ROSTER);
   const remembered = Object.keys(memory.cats).length;
   log(`visit ${v.visit}${v.isNew ? ' (new kitten in the box)' : ''}, ${today.count} kittens${remembered ? `, ${remembered} remembered` : ''}${v.persisted ? '' : ' (no local save: no "tomorrow" promise)'}`);
-  return { visit: v.visit, persisted: v.persisted, cats: today.ids.map((id) => ({ id, size: 'kitten' })), memory };
+  // /: the toy furniture on the play rug (kind + 10 cm rug cell + 45 deg step, max 12; gate FURNITURE_PERSIST)
+  const furniture = readFurniture(visitStorage());
+  return { visit: v.visit, persisted: v.persisted, cats: today.ids.map((id) => ({ id, size: 'kitten' })), memory, furniture };
 }
+/** The bridge's rug list -> the visit record (whitelisted on write; nothing when the gate is closed). */
+function saveFurniture(f) { writeFurniture(visitStorage(), f, undefined, undefined, ROSTER); }
 /** The end card's memory -> the visit record (whitelisted on write; the card text never changes with the outcome). */
 function saveMemory(memory) {
   if (!memory) return;
@@ -98,7 +102,7 @@ class RoomCatSystem extends createSystem({
     // room sim glue (plain data in, three objects out), one hook per XR session. Room / hand details are DEV-only logs
     // (Legal section 10).
     this.life = createSessionLife({
-      makeHook: () => { const v = startVisit(); return createRoomHook({ seed: SESSION_SEED, cats: v.cats, roster: ROSTER, names: NAMES, visit: v.visit, persisted: v.persisted, memory: v.memory, renderer: this.world && this.world.renderer ? this.world.renderer : null, onLog: DEV ? (m) => log(m) : null, onPerf: DEV && this.perf ? (what, d) => this.perf.event(what, d) : null }); },
+      makeHook: () => { const v = startVisit(); return createRoomHook({ seed: SESSION_SEED, cats: v.cats, roster: ROSTER, names: NAMES, visit: v.visit, persisted: v.persisted, memory: v.memory, furniture: v.furniture, saveFurniture, renderer: this.world && this.world.renderer ? this.world.renderer : null, onLog: DEV ? (m) => log(m) : null, onPerf: DEV && this.perf ? (what, d) => this.perf.event(what, d) : null }); },
       attach: (hook) => {
         const entity = this.world.createTransformEntity(hook.group, { persistent: true });
         return () => { if (entity && typeof entity.destroy === 'function') entity.destroy(); };
@@ -251,7 +255,7 @@ class RoomCatSystem extends createSystem({
   /** SK-HUD: the WebXR input sources -> hud-menu.js sources { left, right } (reused scratch; the bridge adds hand fingertips).
    *  ray = targetRaySpace (origin + -Z), select = selectstart / selectend, button = xr-standard 3 (thumbstick click) / 4 / 5 (X Y / A B). */
   readHud(frame, ref) {
-    const mk = () => ({ kind: 'controller', ray: { o: { x: 0, y: 0, z: 0 }, d: { x: 0, y: 0, z: -1 } }, select: false, squeeze: false, button: false, tip: null, grip: { x: 0, y: 0, z: 0 } });
+    const mk = () => ({ kind: 'controller', ray: { o: { x: 0, y: 0, z: 0 }, d: { x: 0, y: 0, z: -1 } }, select: false, squeeze: false, button: false, tip: null, grip: { x: 0, y: 0, z: 0 }, stickX: 0 });
     const S = this.hudScratch || (this.hudScratch = { sources: { left: null, right: null }, slots: { left: mk(), right: mk() }, hide: false, wristToggle: false });
     S.sources.left = null; S.sources.right = null;
     const session = frame && frame.session;
@@ -269,6 +273,7 @@ class RoomCatSystem extends createSystem({
       slot.squeeze = !src.hand && !!(this.hudSq && this.hudSq.get(src));
       const b = !src.hand && src.gamepad ? src.gamepad.buttons : null;
       slot.button = !!(b && ((b[3] && b[3].pressed) || (b[4] && b[4].pressed) || (b[5] && b[5].pressed)));
+      const ax = !src.hand && src.gamepad ? src.gamepad.axes : null; slot.stickX = ax && ax.length > 2 && Number.isFinite(ax[2]) ? ax[2] : 0; // Q-GE2: turns a held furniture piece
       slot.tip = null;
       let g = null; if (src.gripSpace) { try { g = frame.getPose(src.gripSpace, ref); } catch (e) { g = null; } }
       const gp = g ? g.transform.position : null;

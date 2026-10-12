@@ -331,3 +331,280 @@ export function wandView(st) {
 
 /** The basket's surface height for a given room (host convenience / tests). */
 export function basketSurfaceY(room, basket) { const s = roomSurface(room, basket.surf); return s ? s.y : basket.y; }
+
+/* ---- Q-GE2 2026-10-12 (the owner's Quest list #7 "Still can't move furniture"): VIRTUAL FURNITURE the player places, grabs,
+   moves, rotates and removes. PURE like the wand above (no three / WebXR / DOM), same file so the public allowlist does not
+   change. The art is the existing original F1 / B5 furniture (design/batches/B5-furniture-views prims, Design 1): each kind
+   is a few boxes / cylinders in the F1 palette, in metres (0.006 m per art unit), y up from the floor, centred on its
+   footprint; the host draws `parts` with plain three meshes (no new art files).
+   Rules:
+   - furnitureAdd(st, kind, ctx): a new piece stands on the floor about spawnAheadM ahead of the viewer (else the first free
+     spot beside / behind that), facing them, its footprint kept inside the floor's bounds; at most maxPieces.
+   - furnitureStep(st, ev, ctx): grab_start (controller grip or hand pinch; pinch_start is the same) within grabM of a
+     piece's box, or a controller ray (ev.ray) that hits the box within rayMaxM, GRABS it (consumed = true: not a scruff /
+     wand / box pinch). While held (grab_move / move / pinch_hold of that hand) the piece slides on the floor under the
+     hand (near grab: the grab offset is kept) or under the ray's floor hit (ray grab); in a near grab a finite ev.yaw
+     (hand / controller heading) twists it by the yaw change since the grab. grab_end / pinch_release drops it: over the BIN (within binR of st.bin on the floor
+     plane) it is REMOVED, else it stays where it is (clamped into the floor bounds). lost = dropped where it is.
+     rotate { hand, x (stick -1..1), dt } turns the held piece, else the last touched one (stickRate rad/s past stickDead).
+   - furnitureRemove(st, id?) removes a piece (default: the held / last touched one) = the picker's "Remove" action.
+   - furnitureMeshes(st, floorY) -> room.js meshes ({ id, label, min, max, footprint }) so the NEXT room build (session
+     start) makes the pieces surfaces / obstacles for the cats. A live roomcat session keeps its room (game/core roomcat
+     binds it at creation), so mid-session the pieces are props the player arranges.
+   - SAVED between visits ONLY as Legal / FOR-DEV allows (visit-store.js FURNITURE_PERSIST + sanitizeFurniture):
+     furnitureRugFrame(room) = the PLAY RUG (room.js virtual rug: room.rug, surface 'rug'; null in a scanned room = nothing is
+     saved or restored there); furnitureSave(st, frame) -> { v: 1, items: [[k, x, z, r]] }: k = FURN_VR_KINDS index, x / z =
+     10 cm cells from the rug centre on the rug's own axes (a piece whose centre is off the rug is NOT saved), r = yaw in
+     45 deg steps, max 12; nothing else (no y / size / time / rug pose). furnitureRestore(st, saved, frame) puts saved
+     pieces on their rug cells (clamped to the rug only, never snapped to real-room planes / meshes); an unmoved restored
+     piece keeps its saved cell (p.saved) so a load-time nudge is never written back; a drag or twist clears it.
+   - Hot path (a held piece every frame) writes into the state's own objects: zero allocation per frame. */
+export const FURN_VR_VERSION = 1;
+export const FURN_VR_TUNING = Object.freeze({
+  maxPieces: 8, spawnAheadM: 0.9, grabM: 0.08, rayMaxM: 3.0, binR: 0.3,
+  stickDead: 0.3, stickRate: 2.5, edgeM: 0.02,
+});
+function wdFk(kind, label, name, w, h, d, parts) { return Object.freeze({ kind, label, name, w, h, d, parts: Object.freeze(parts.map((p) => Object.freeze(p))) }); }
+/** The picker: one tile per kind (name = tile text). Original art: F1 / B5 prims (Design 1), colours = F1 COLORS. */
+export const FURN_VR_KINDS = Object.freeze([
+  wdFk("cat_tree", "cat tree", "Cat tree", 0.606, 0.768, 0.36, [
+    {t: 'box', x0: -0.279, x1: 0.273, y0: 0, y1: 0.072, z0: -0.18, z1: 0.18, c: '#d9a878'},
+    {t: 'cyl', cx: -0.003, cz: 0, r: 0.048, y0: 0.06, y1: 0.696, c: '#e6cf9c'},
+    {t: 'box', x0: 0.009, x1: 0.273, y0: 0.228, y1: 0.432, z0: -0.12, z1: 0.12, c: '#cdbdf0'},
+    {t: 'cyl', cx: 0.141, cz: 0, r: 0.162, y0: 0.402, y1: 0.486, c: '#f6bfd3'},
+    {t: 'box', x0: -0.231, x1: -0.015, y0: 0.642, y1: 0.696, z0: -0.078, z1: 0.078, c: '#d9a878'},
+    {t: 'cyl', cx: -0.123, cz: 0, r: 0.18, y0: 0.672, y1: 0.768, c: '#f6bfd3'},
+    {t: 'box', x0: -0.255, x1: -0.183, y0: 0.474, y1: 0.66, z0: -0.138, z1: -0.066, c: '#cdbdf0'}]),
+  wdFk("scratch_post", "cat tree", "Scratch post", 0.36, 0.762, 0.36, [
+    {t: 'box', x0: -0.18, x1: 0.18, y0: 0, y1: 0.072, z0: -0.18, z1: 0.18, c: '#d9a878'},
+    {t: 'cyl', cx: 0, cz: 0, r: 0.066, y0: 0.06, y1: 0.708, c: '#e6cf9c'},
+    {t: 'cyl', cx: 0, cz: 0, r: 0.144, y0: 0.678, y1: 0.762, c: '#bfe6cf'},
+    {t: 'box', x0: 0.09, x1: 0.15, y0: 0.51, y1: 0.708, z0: -0.03, z1: 0.03, c: '#bfe6cf'}]),
+  wdFk("cushion", "bed", "Cushion", 0.6, 0.258, 0.576, [
+    {t: 'box', x0: -0.3, x1: 0.3, y0: 0, y1: 0.258, z0: -0.288, z1: 0.288, c: '#f6bfd3'}]),
+  wdFk("box", "storage", "Box", 0.648, 0.432, 0.42, [
+    {t: 'box', x0: -0.264, x1: 0.264, y0: 0, y1: 0.324, z0: -0.21, z1: 0.198, c: '#e2b27a'},
+    {t: 'box', x0: -0.324, x1: -0.264, y0: 0.3, y1: 0.42, z0: -0.198, z1: 0.186, c: '#e2b27a'},
+    {t: 'box', x0: 0.264, x1: 0.324, y0: 0.3, y1: 0.432, z0: -0.198, z1: 0.186, c: '#e2b27a'},
+    {t: 'box', x0: -0.216, x1: 0.216, y0: 0.324, y1: 0.396, z0: 0.186, z1: 0.21, c: '#e2b27a'}]),
+  wdFk("couch", "couch", "Mini couch", 1.032, 0.456, 0.42, [
+    {t: 'box', x0: -0.408, x1: -0.36, y0: 0, y1: 0.048, z0: -0.21, z1: -0.162, c: '#b9845a'},
+    {t: 'box', x0: -0.408, x1: -0.36, y0: 0, y1: 0.048, z0: 0.15, z1: 0.198, c: '#b9845a'},
+    {t: 'box', x0: 0.36, x1: 0.408, y0: 0, y1: 0.048, z0: -0.21, z1: -0.162, c: '#b9845a'},
+    {t: 'box', x0: 0.36, x1: 0.408, y0: 0, y1: 0.048, z0: 0.15, z1: 0.198, c: '#b9845a'},
+    {t: 'box', x0: -0.432, x1: 0.432, y0: 0.036, y1: 0.252, z0: -0.198, z1: 0.186, c: '#bfe6cf'},
+    {t: 'box', x0: -0.396, x1: 0.396, y0: 0.192, y1: 0.456, z0: 0.078, z1: 0.21, c: '#8fcaa8'},
+    {t: 'box', x0: -0.516, x1: -0.36, y0: 0.036, y1: 0.348, z0: -0.21, z1: 0.198, c: '#bfe6cf'},
+    {t: 'box', x0: 0.36, x1: 0.516, y0: 0.036, y1: 0.348, z0: -0.21, z1: 0.198, c: '#bfe6cf'},
+    {t: 'box', x0: 0.132, x1: 0.312, y0: 0.252, y1: 0.396, z0: 0.03, z1: 0.09, c: '#f6bfd3'}]),
+  wdFk("plant", "plant", "Plant", 0.324, 0.624, 0.324, [
+    {t: 'cyl', cx: 0, cz: 0, r: 0.12, y0: 0, y1: 0.228, c: '#e98f72'},
+    {t: 'box', x0: -0.162, x1: 0.162, y0: 0.228, y1: 0.624, z0: -0.162, z1: 0.162, c: '#8fd19a'}])
+]);
+export const FURN_VR_PICKER = Object.freeze(FURN_VR_KINDS.map((k) => Object.freeze({ id: k.kind, label: k.name })).concat([Object.freeze({ id: 'remove', label: 'Remove' })]));
+export function furnitureKind(kind) { for (let i = 0; i < FURN_VR_KINDS.length; i++) if (FURN_VR_KINDS[i].kind === kind) return FURN_VR_KINDS[i]; return null; }
+
+/** Fresh state. opts = { bin: { x, y, z } | null (the bin tile on the floor), floor: { x0, z0, x1, z1 } | null (bounds) } */
+export function createFurnitureState(opts) {
+  const o = opts || {};
+  return {
+    pieces: [], seq: 0, sel: null, bin: o.bin ? { x: o.bin.x, y: o.bin.y, z: o.bin.z } : null, floor: o.floor || null, version: 0,
+    held: { left: null, right: null }, // per hand: { piece, mode: 'near' | 'ray', ox, oz, yaw0, hy0 }
+    out: { consumed: false, event: null, id: null }, T: FURN_VR_TUNING,
+  };
+}
+
+/** floor bounds from a room.js room (its floor surface's bb) */
+export function furnitureFloor(room) {
+  const f = room && room.floor != null ? roomSurface(room, room.floor) : null;
+  return f && f.bb ? { x0: f.bb.x0, z0: f.bb.z0, x1: f.bb.x1, z1: f.bb.z1, y: f.y } : null;
+}
+
+function wdClampPiece(st, p) {
+  const F = st.floor; if (!F) return;
+  const k = furnitureKind(p.kind), c = Math.abs(Math.cos(p.yaw)), s = Math.abs(Math.sin(p.yaw));
+  const hx = (k.w * c + k.d * s) / 2 + st.T.edgeM, hz = (k.w * s + k.d * c) / 2 + st.T.edgeM;
+  p.x = F.x1 - F.x0 <= 2 * hx ? (F.x0 + F.x1) / 2 : Math.max(F.x0 + hx, Math.min(F.x1 - hx, p.x));
+  p.z = F.z1 - F.z0 <= 2 * hz ? (F.z0 + F.z1) / 2 : Math.max(F.z0 + hz, Math.min(F.z1 - hz, p.z));
+}
+
+/** Add a piece of `kind` ahead of the viewer. ctx = { viewer: { x, z }, forward: { x, z }, floorY }. Returns it, or null. */
+export function furnitureAdd(st, kind, ctx) {
+  const k = furnitureKind(kind); if (!k || st.pieces.length >= st.T.maxPieces) return null;
+  const c = ctx || {}, v = c.viewer || { x: 0, z: 0 }, f = c.forward || { x: 0, z: -1 };
+  const fl = Math.sqrt(f.x * f.x + f.z * f.z), fx = fl > 1e-9 ? f.x / fl : 0, fz = fl > 1e-9 ? f.z / fl : -1;
+  const y = Number.isFinite(c.floorY) ? c.floorY : (st.floor && Number.isFinite(st.floor.y) ? st.floor.y : 0);
+  const p = { id: 'vf' + (++st.seq), kind, x: 0, y, z: 0, yaw: Math.atan2(fx, fz), held: null }; // the art's front (local -z, F1 z = 0) faces the viewer
+  // the first free spot ahead: straight ahead, then to the sides, then further out (a new piece never lands inside another)
+  const r = Math.max(k.w, k.d) / 2;
+  for (let i = 0; i < WD_SPAWN.length; i++) {
+    const a = st.T.spawnAheadM + WD_SPAWN[i][1], sd = WD_SPAWN[i][0]; // side offset along the viewer's right (-fz, fx)
+    p.x = v.x + fx * a - fz * sd; p.z = v.z + fz * a + fx * sd; wdClampPiece(st, p);
+    let free = true;
+    for (const q of st.pieces) { const kq = furnitureKind(q.kind), rr = r + Math.max(kq.w, kq.d) / 2; if ((q.x - p.x) * (q.x - p.x) + (q.z - p.z) * (q.z - p.z) < rr * rr) { free = false; break; } }
+    if (free) break;
+    if (i === WD_SPAWN.length - 1) { p.x = v.x + fx * st.T.spawnAheadM; p.z = v.z + fz * st.T.spawnAheadM; wdClampPiece(st, p); } // crowded: straight ahead
+  }
+  st.pieces.push(p); st.sel = p.id; st.version++;
+  return p;
+}
+
+/** Remove a piece (default: the one held, else the last touched). Returns true when one went. */
+export function furnitureRemove(st, id) {
+  let pid = id;
+  if (pid == null) pid = st.held.right ? st.held.right.piece.id : st.held.left ? st.held.left.piece.id : st.sel;
+  const i = st.pieces.findIndex((p) => p.id === pid); if (i < 0) return false;
+  const p = st.pieces[i]; st.pieces.splice(i, 1);
+  for (const h of ['left', 'right']) if (st.held[h] && st.held[h].piece === p) st.held[h] = null;
+  if (st.sel === p.id) st.sel = st.pieces.length ? st.pieces[st.pieces.length - 1].id : null;
+  st.version++;
+  return true;
+}
+
+/** point (world) -> the piece's local frame (x along its width, z along its depth), written into `o` */
+function wdLocal(p, x, z, o) { const c = Math.cos(p.yaw), s = Math.sin(p.yaw), dx = x - p.x, dz = z - p.z; o.x = dx * c - dz * s; o.z = dx * s + dz * c; return o; }
+const WD_L = { x: 0, z: 0 }, WD_D = { x: 0, z: 0 };
+const WD_SPAWN = [[0, 0], [0.75, 0], [-0.75, 0], [0, 0.8], [0.75, 0.8], [-0.75, 0.8], [1.4, 0], [-1.4, 0]]; // [side, extra ahead] m
+/** squared distance from p3 to the piece's box (0 inside) */
+function wdBoxD2(pc, q) {
+  const k = furnitureKind(pc.kind); wdLocal(pc, q.x, q.z, WD_L);
+  const ax = Math.max(0, Math.abs(WD_L.x) - k.w / 2), az = Math.max(0, Math.abs(WD_L.z) - k.d / 2), ly = q.y - pc.y, ay = ly < 0 ? -ly : Math.max(0, ly - k.h);
+  return ax * ax + ay * ay + az * az;
+}
+/** ray (o, d) vs the piece's oriented box: distance along the ray, or -1 */
+function wdRayHit(pc, o, d) {
+  const k = furnitureKind(pc.kind); wdLocal(pc, o.x, o.z, WD_L);
+  const c = Math.cos(pc.yaw), s = Math.sin(pc.yaw), dx = d.x * c - d.z * s, dz = d.x * s + d.z * c;
+  let t0 = 0, t1 = Infinity;
+  const slab = (o0, dd, lo, hi) => { if (Math.abs(dd) < 1e-9) return o0 >= lo && o0 <= hi; let a = (lo - o0) / dd, b2 = (hi - o0) / dd; if (a > b2) { const tt = a; a = b2; b2 = tt; } if (a > t0) t0 = a; if (b2 < t1) t1 = b2; return t0 <= t1; };
+  if (!slab(WD_L.x, dx, -k.w / 2, k.w / 2) || !slab(o.y - pc.y, d.y, 0, k.h) || !slab(WD_L.z, dz, -k.d / 2, k.d / 2)) return -1;
+  return t0;
+}
+/** The piece a grab at point q (or along ray) would take: { piece, mode } or null. Hosts use it to arbitrate (wand > kitten > furniture). */
+export function furnitureHit(st, q, ray) {
+  let best = null, bd = st.T.grabM * st.T.grabM, mode = 'near';
+  if (q && Number.isFinite(q.x)) for (const p of st.pieces) { const d2 = wdBoxD2(p, q); if (d2 <= bd) { bd = d2; best = p; } }
+  if (!best && ray && ray.o && ray.d) { let bt = st.T.rayMaxM; for (const p of st.pieces) { const t = wdRayHit(p, ray.o, ray.d); if (t >= 0 && t <= bt) { bt = t; best = p; } } mode = 'ray'; }
+  return best ? { piece: best, mode } : null;
+}
+/** the ray's hit on the floor plane y, written into WD_D; false when it never reaches it */
+function wdRayFloor(ray, y) { const o = ray.o, d = ray.d; if (!(d.y < -1e-4)) return false; const t = (y - o.y) / d.y; if (t < 0 || t > 20) return false; WD_D.x = o.x + d.x * t; WD_D.z = o.z + d.z * t; return true; }
+
+/**
+ * One input event. ev = { type, hand, p?, ray?, yaw?, x?, dt? } (types above; gestures.js pinch events work as is).
+ * ctx = { room? } (unused today; reserved). Returns st.out (REUSED): { consumed, event: 'grab' | 'move' | 'drop' | 'removed' | 'rotate' | null, id }.
+ */
+export function furnitureStep(st, ev, ctx) {
+  const out = st.out; out.consumed = false; out.event = null; out.id = null;
+  if (!ev) return out;
+  const hand = ev.hand === 'left' ? 'left' : 'right', H = st.held[hand], T = st.T;
+  const ty = ev.type;
+  if ((ty === 'grab_start' || ty === 'pinch_start') && !H) {
+    const hit = furnitureHit(st, ev.p, ev.ray); if (!hit) return out;
+    const p = hit.piece;
+    for (const h of ['left', 'right']) if (st.held[h] && st.held[h].piece === p) return out; // the other hand has it
+    let ox = 0, oz = 0;
+    if (hit.mode === 'near') { ox = p.x - ev.p.x; oz = p.z - ev.p.z; }
+    else if (wdRayFloor(ev.ray, p.y)) { ox = p.x - WD_D.x; oz = p.z - WD_D.z; }
+    st.held[hand] = { piece: p, mode: hit.mode, ox, oz, yaw0: p.yaw, hy0: hit.mode === 'near' && Number.isFinite(ev.yaw) ? ev.yaw : null }; // a ray drag never twists (turning the controller aims the ray)
+    p.held = hand; st.sel = p.id; st.version++;
+    out.consumed = true; out.event = 'grab'; out.id = p.id; return out;
+  }
+  if (!H) { if (ty === 'rotate') return wdRotate(st, st.pieces.find((q) => q.id === st.sel), ev, out); return out; }
+  const p = H.piece;
+  if (ty === 'grab_move' || ty === 'move' || ty === 'pinch_hold') {
+    if (H.mode === 'ray' && ev.ray && ev.ray.o && ev.ray.d) { if (wdRayFloor(ev.ray, p.y)) { p.x = WD_D.x + H.ox; p.z = WD_D.z + H.oz; } }
+    else if (ev.p && Number.isFinite(ev.p.x)) { p.x = ev.p.x + H.ox; p.z = ev.p.z + H.oz; }
+    if (H.hy0 != null && Number.isFinite(ev.yaw)) p.yaw = H.yaw0 + (ev.yaw - H.hy0);
+    p.saved = null; // the player moved it: its new rug cell is saved from now on (rule 4)
+    wdClampPiece(st, p); out.consumed = true; out.event = 'move'; out.id = p.id; return out;
+  }
+  if (ty === 'rotate') return wdRotate(st, p, ev, out);
+  if (ty === 'grab_end' || ty === 'pinch_release' || ty === 'lost') {
+    st.held[hand] = null; p.held = null; out.consumed = ty !== 'lost'; out.id = p.id;
+    const B = st.bin;
+    if (B && ty !== 'lost') { const dx = p.x - B.x, dz = p.z - B.z; if (dx * dx + dz * dz <= T.binR * T.binR) { furnitureRemove(st, p.id); out.event = 'removed'; return out; } }
+    wdClampPiece(st, p); st.version++; out.event = 'drop'; return out;
+  }
+  return out;
+}
+function wdRotate(st, p, ev, out) {
+  if (!p) return out; const x = Number(ev.x), dt = Number(ev.dt);
+  if (!Number.isFinite(x) || !Number.isFinite(dt) || Math.abs(x) < st.T.stickDead) return out;
+  const dy = x * st.T.stickRate * Math.min(dt, 0.1); p.yaw += dy; p.saved = null;
+  if (p.yaw > Math.PI) p.yaw -= 2 * Math.PI; else if (p.yaw < -Math.PI) p.yaw += 2 * Math.PI;
+  const H = p.held ? st.held[p.held] : null; if (H) H.yaw0 += dy; // stick and twist add up
+  wdClampPiece(st, p); if (!p.held) st.version++;
+  out.consumed = true; out.event = 'rotate'; out.id = p.id; return out;
+}
+
+/** The play rug's frame { cx, cz, hx, hz } (rug-local axes = the rug's: room.js lays it axis-aligned), or null when the room
+ *  has no play rug (a scanned floor). Read from the rug surface only: never planes / meshes / anchors (rule 3). */
+export function furnitureRugFrame(room) {
+  if (!room || room.rug !== true) return null;
+  const s = roomSurface(room, 'rug');
+  if (!s || !s.bb || !s.virtual) return null;
+  const b = s.bb;
+  return { cx: (b.x0 + b.x1) / 2, cz: (b.z0 + b.z1) / 2, hx: (b.x1 - b.x0) / 2, hz: (b.z1 - b.z0) / 2 };
+}
+const WD_CELL = 0.1, WD_ROT = Math.PI / 4, WD_MAXSAVE = 12;
+function wdKindIndex(kind) { for (let i = 0; i < FURN_VR_KINDS.length; i++) if (FURN_VR_KINDS[i].kind === kind) return i; return -1; }
+/** One piece -> [k, x, z, r] on the rug grid, or null (unknown kind / centre off the rug). */
+export function furnitureCell(p, frame) {
+  const k = wdKindIndex(p && p.kind); if (k < 0 || !frame || !Number.isFinite(p.x) || !Number.isFinite(p.z)) return null;
+  const dx = p.x - frame.cx, dz = p.z - frame.cz;
+  if (Math.abs(dx) > frame.hx + 1e-9 || Math.abs(dz) > frame.hz + 1e-9) return null; // off the rug: not saved (rule 3)
+  const mx = Math.floor(frame.hx / WD_CELL + 1e-9), mz = Math.floor(frame.hz / WD_CELL + 1e-9);
+  const cx = Math.max(-mx, Math.min(mx, Math.round(dx / WD_CELL))), cz = Math.max(-mz, Math.min(mz, Math.round(dz / WD_CELL)));
+  const r = (((Math.round((Number.isFinite(p.yaw) ? p.yaw : 0) / WD_ROT)) % 8) + 8) % 8;
+  return [k, cx === 0 ? 0 : cx, cz === 0 ? 0 : cz, r];
+}
+/** What to save (rule 2): { v: 1, items } from the pieces ON the rug, max 12; an unmoved restored piece gives its saved
+ *  cell back (rule 4). null when there is no play rug (nothing saved, the stored list is left as it is). */
+export function furnitureSave(st, frame) {
+  if (!frame) return null;
+  const items = [];
+  for (const p of st.pieces) {
+    if (items.length >= WD_MAXSAVE) break;
+    const c = p.saved ? p.saved.slice() : furnitureCell(p, frame);
+    if (c) items.push(c);
+  }
+  return { v: 1, items };
+}
+/** Put saved pieces (visit-store.js readFurniture, already whitelisted) on their rug cells; returns how many. Clamped into the
+ *  furniture floor (the rug) only; never snapped to a real-room surface (rule 3). Each keeps p.saved until the player moves it. */
+export function furnitureRestore(st, saved, frame, floorY) {
+  if (!frame || !saved || !Array.isArray(saved.items)) return 0;
+  const y = Number.isFinite(floorY) ? floorY : (st.floor && Number.isFinite(st.floor.y) ? st.floor.y : 0);
+  let n = 0;
+  for (const it of saved.items) {
+    if (n >= WD_MAXSAVE || !Array.isArray(it) || it.length !== 4) continue;
+    const kd = FURN_VR_KINDS[it[0]]; if (!kd || !Number.isInteger(it[1]) || !Number.isInteger(it[2]) || !Number.isInteger(it[3])) continue;
+    let yaw = (it[3] & 7) * WD_ROT; if (yaw > Math.PI) yaw -= 2 * Math.PI;
+    const p = { id: 'vf' + (++st.seq), kind: kd.kind, x: frame.cx + it[1] * WD_CELL, y, z: frame.cz + it[2] * WD_CELL, yaw, held: null, saved: [it[0], it[1], it[2], it[3] & 7] };
+    wdClampPiece(st, p); // may nudge it on screen; p.saved keeps the stored cell (rule 4)
+    st.pieces.push(p); n++;
+  }
+  if (n) { st.sel = st.pieces[st.pieces.length - 1].id; st.version++; }
+  return n;
+}
+
+/** room.js meshes for the next room build: { id, label, min, max, footprint (oriented corners) } per piece */
+export function furnitureMeshes(st, floorY) {
+  const res = [];
+  for (const p of st.pieces) {
+    const k = furnitureKind(p.kind), c = Math.cos(p.yaw), s = Math.sin(p.yaw), y = Number.isFinite(floorY) ? floorY : p.y, fp = [];
+    for (const [lx, lz] of [[-k.w / 2, -k.d / 2], [k.w / 2, -k.d / 2], [k.w / 2, k.d / 2], [-k.w / 2, k.d / 2]]) fp.push({ x: p.x + lx * c + lz * s, z: p.z - lx * s + lz * c });
+    let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity; for (const q of fp) { x0 = Math.min(x0, q.x); x1 = Math.max(x1, q.x); z0 = Math.min(z0, q.z); z1 = Math.max(z1, q.z); }
+    res.push({ id: p.id, label: k.label, min: { x: x0, y, z: z0 }, max: { x: x1, y: y + k.h, z: z1 }, footprint: fp });
+  }
+  return res;
+}
+/** what to draw: the pieces (their own objects: { id, kind, x, y, z, yaw, held }), the bin, the selected id */
+export function furnitureView(st) { return st; }
+/** local part -> world: a box part's centre for drawing (x / z rotated by yaw), written into `o` */
+export function furniturePartCentre(p, part, o) {
+  const lx = part.t === 'box' ? (part.x0 + part.x1) / 2 : part.cx, lz = part.t === 'box' ? (part.z0 + part.z1) / 2 : part.cz;
+  const c = Math.cos(p.yaw), s = Math.sin(p.yaw);
+  o.x = p.x + lx * c + lz * s; o.y = p.y + (part.y0 + part.y1) / 2; o.z = p.z - lx * s + lz * c; return o;
+}

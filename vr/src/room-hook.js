@@ -20,7 +20,7 @@ import { BoxGeometry, CanvasTexture, CircleGeometry, CylinderGeometry, DoubleSid
 const UP = new Vector3(0, 1, 0), tmpV = new Vector3();
 import { createCatBillboard, createSpriteCache } from './cat-billboard.js';
 import { createRoomBridge } from './room-bridge.js';
-import { WAND_TUNING } from './wand.js';
+import { WAND_TUNING, furnitureKind, FURN_VR_TUNING } from './wand.js';
 import { boxAnim, FX_TUNING } from './fx.js';
 import { catArtDraw } from './cat-art.js';
 // P0a: Design's VR1 sprites (vr/public/art, loader vr/src/art/atlas.js) through the bundled slim manifest (no fetch; the
@@ -98,7 +98,7 @@ function hudRound(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); c
  *   in the new local-floor frame.
  */
 export function createRoomHook(opts = {}) {
-  const bridge = createRoomBridge({ seed: opts.seed, cats: opts.cats, size: opts.size, arc: opts.arc, onLog: opts.onLog, roster: opts.roster, visit: opts.visit, names: opts.names, persisted: opts.persisted, leftHanded: opts.leftHanded, memory: opts.memory });
+  const bridge = createRoomBridge({ seed: opts.seed, cats: opts.cats, size: opts.size, arc: opts.arc, onLog: opts.onLog, roster: opts.roster, visit: opts.visit, names: opts.names, persisted: opts.persisted, leftHanded: opts.leftHanded, memory: opts.memory, furniture: opts.furniture, saveFurniture: opts.saveFurniture });
   const group = new Group();
   group.name = 'kca-room';
   const cats = new Map(); // cat id -> billboard
@@ -184,6 +184,26 @@ export function createRoomHook(opts = {}) {
   stick.visible = false; group.add(stick);
   const feather = new Mesh(new CircleGeometry(0.035, 12), new MeshBasicMaterial({ color: 0xff9ec7, side: DoubleSide, transparent: true, opacity: 0.95 }));
   feather.visible = false; group.add(feather);
+  // Q-GE2: furniture meshes, one Group per piece id (built once from its parts, dropped + disposed when the piece goes)
+  const furnGroups = new Map(), furnSeen = new Set();
+  const bin = new Mesh(new RingGeometry(FURN_VR_TUNING.binR * 0.75, FURN_VR_TUNING.binR, 32), new MeshBasicMaterial({ color: 0xe597b5, side: DoubleSide, transparent: true, opacity: 0.8 }));
+  bin.rotation.x = -Math.PI / 2; bin.visible = false; group.add(bin);
+  function furnGroup(p) {
+    const g = new Group(), k = furnitureKind(p.kind);
+    for (const q of k.parts) {
+      const geo = q.t === 'box' ? new BoxGeometry(q.x1 - q.x0, q.y1 - q.y0, q.z1 - q.z0) : new CylinderGeometry(q.r, q.r, q.y1 - q.y0, 16);
+      const m = new Mesh(geo, new MeshBasicMaterial({ color: q.c }));
+      m.position.set(q.t === 'box' ? (q.x0 + q.x1) / 2 : q.cx, (q.y0 + q.y1) / 2, q.t === 'box' ? (q.z0 + q.z1) / 2 : q.cz); g.add(m);
+    }
+    group.add(g); return g;
+  }
+  function syncFurniture(fs) {
+    furnSeen.clear();
+    if (fs) for (const p of fs.pieces) { let g = furnGroups.get(p.id); if (!g) { g = furnGroup(p); furnGroups.set(p.id, g); } g.position.set(p.x, p.y + (p.held ? 0.01 : 0), p.z); g.rotation.set(0, p.yaw, 0); g.visible = true; furnSeen.add(p.id); }
+    if (furnGroups.size !== furnSeen.size) for (const [id, g] of furnGroups) if (!furnSeen.has(id)) { group.remove(g); g.traverse((o) => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); }); furnGroups.delete(id); }
+    const showBin = !!(fs && fs.bin && (fs.held.left || fs.held.right)); bin.visible = showBin; // the bin shows while a piece is held
+    if (showBin) bin.position.set(fs.bin.x, fs.bin.y + 0.005, fs.bin.z);
+  }
   // cards: hint / caption (GE2-B: small, low and to the side, placed + faded by tip-card.js via result.tipCard) and the end card (bigger, centred)
   const card = makeCard(TIP_TUNING.w, TIP_TUNING.h, 512); group.add(card.mesh);
   const endCard = makeCard(END_W, END_H, 768); group.add(endCard.mesh);
@@ -388,23 +408,28 @@ export function createRoomHook(opts = {}) {
       b.setView(c);
       b.setPose(c.pose);
       const j = juice && juice[c.id]; if (j) b.setSquash(j.sx, j.sy);
+      const a0 = anim.get(c.id), spd = Number.isFinite(c.speed) ? c.speed : a0 ? a0.speed : 0; // Q-GE2: roomcat's eased speed first
+      b.setMotion(spd, c.tell, c.stalk, t); // Q-GE2: rump wiggle / freeze squash / walk bob / play-bow (procedural, no art)
       // P0a: the atlas frame for (view, pose, time since this anim started, walk speed), hi / lo by distance rank
       const pose = artPose(c.pose), aid = artIdOf(c.id);
       let f = null;
       if (atlas && pose && atlas.resolveCat(aid)) {
         let a = anim.get(c.id);
-        if (!a) { a = { key: '', since: tNow, x: c.x, z: c.z, t: tNow, speed: 0, lod: 'hi' }; anim.set(c.id, a); }
+        if (!a) { a = { key: '', since: tNow, x: c.x, z: c.z, t: tNow, speed: 0, lod: 'hi', cyc: 0, ct: tNow }; anim.set(c.id, a); }
         const dt = (tNow - a.t) / 1000; if (dt > 0.001) { const dx = c.x - a.x, dz = c.z - a.z; a.speed += (Math.sqrt(dx * dx + dz * dz) / dt - a.speed) * 0.3; a.x = c.x; a.z = c.z; a.t = tNow; }
-        const key = c.sprite + '|' + pose; if (key !== a.key) { a.key = key; a.since = tNow; }
+        const key = c.sprite + '|' + pose; if (key !== a.key) { a.key = key; a.since = tNow; a.cyc = 0; }
+        // Q-GE2 scurry fix: the walk cycle runs on its own clock, dt x the clamped speed scale, so easing never skips frames
+        const sp = Number.isFinite(c.speed) ? c.speed : a.speed, cdt = Math.min(0.1, Math.max(0, (tNow - a.ct) / 1000)); a.ct = tNow;
+        a.cyc += cdt * atlas.fpsScale(pose, sp);
         // LOD by distance only (Design 11:2x): hi within 2.5 m, lo beyond
         if (head && tNow - lodT > 500) { a.lod = pickLodStable(Math.sqrt((head.x - c.x) ** 2 + (head.z - c.z) ** 2), a.lod); } // hysteresis: no hi <-> lo churn at the 2.5 m line
         // cat-views decides the sprite sheet (side / front / back / above / below) + the mirror (flipX = the heading points to the
         // camera's left) + rotDeg for the top view; the atlas only supplies the frame (side art faces right, top art head +x)
-        f = atlas.getFrame(aid, c.sprite, pose, (tNow - a.since) / 1000, { lod: a.lod, speedMps: a.speed, flipX: !!c.flipX });
+        f = atlas.getFrame(aid, c.sprite, pose, (tNow - a.since) / 1000, { lod: a.lod, speedMps: sp, cycleT: a.cyc, flipX: !!c.flipX });
       }
       let ftex = f ? drawTexture(f.file, t) : null;
       if (f && !ftex) { // this sheet is not drawable yet (still decoding / no GPU room): the other lod, else the canvas sprite
-        const g = atlas.getFrame(aid, c.sprite, pose, (tNow - anim.get(c.id).since) / 1000, { lod: f.lod === 'hi' ? 'lo' : 'hi', speedMps: anim.get(c.id).speed, flipX: !!c.flipX });
+        const g = atlas.getFrame(aid, c.sprite, pose, (tNow - anim.get(c.id).since) / 1000, { lod: f.lod === 'hi' ? 'lo' : 'hi', speedMps: Number.isFinite(c.speed) ? c.speed : anim.get(c.id).speed, cycleT: anim.get(c.id).cyc, flipX: !!c.flipX });
         const gt = g ? drawTexture(g.file, t) : null; if (gt) { f = g; ftex = gt; }
       }
       if (f && ftex) { b.setAtlasFrame(f, ftex); const a = anim.get(c.id); if (a) { const sh = a.shown || (a.shown = {}); sh.cat = f.cat; sh.view = f.view; sh.anim = f.anim; sh.index = f.index; sh.count = f.count; sh.sheet = f.sheet; sh.lod = f.lod; sh.file = f.file; sh.rect = f.rect; sh.uv = f.uv; sh.flipX = f.flipX; sh.flipY = ftex.flipY; sh.kind = imageKind(ftex.image); sh.sprite = c.sprite; sh.pose = pose; } } // CG NIT: reuse the record (no per-kitten object per frame)
@@ -467,7 +492,7 @@ export function createRoomHook(opts = {}) {
         const cu = HT.stripH / 2 + HT.gap + HL.gridH / 2; // the grid centre sits this far above the strip centre
         hudTiles.mesh.quaternion.copy(hudStrip.mesh.quaternion);
         hudTiles.mesh.position.set(P.c.x + P.u.x * cu, P.c.y + P.u.y * cu, P.c.z + P.u.z * cu); hudTiles.mesh.visible = true;
-        let tk = ''; for (const t of hv.tiles) tk += (t.hover ? 'h' : '-') + (t.pressed ? 'p' : '-') + (t.active ? 'a' : '-') + (t.disabled ? 'd' : '-');
+        let tk = hv.page || ''; for (const t of hv.tiles) tk += t.id + (t.hover ? 'h' : '-') + (t.pressed ? 'p' : '-') + (t.active ? 'a' : '-') + (t.disabled ? 'd' : '-');
         if (tk !== hudTilesKey) {
           hudTilesKey = tk;
           hudTiles.draw((ctx, W, H) => {
@@ -495,6 +520,8 @@ export function createRoomHook(opts = {}) {
         if (bm && bm.show) { const a = l.geometry.attributes.position; a.setXYZ(0, bm.o.x, bm.o.y, bm.o.z); a.setXYZ(1, bm.e.x, bm.e.y, bm.e.z); a.needsUpdate = true; l.visible = true; } else l.visible = false;
       }
     } else { hudStrip.mesh.visible = false; hudTiles.mesh.visible = false; hudCursors.left.visible = false; hudCursors.right.visible = false; hudBeams.left.visible = false; hudBeams.right.visible = false; }
+    // Q-GE2 (owner #7): placed furniture (wand.js pieces: F1 / B5 original art as boxes + cylinders) and the bin ring
+    syncFurniture(result.furniture);
     // W3: wand + basket (wand.js view)
     const w = result.wand;
     if (w) {

@@ -137,6 +137,15 @@ function drawCat(ctx, s) {
 }
 
 const DEG2RAD = Math.PI / 180;
+/** Q-GE2 gait render (brief CAT-MOVEMENT-B 3/6): procedural motion layered over any frame, scalars only (no per-frame allocation) */
+export const GAIT = Object.freeze({
+  bobM: 0.0025, bobStrideM: 0.3, bobMinMps: 0.03, // walk / run body bob: 2-3 mm, two bumps per cycle of 0.3 m
+  wiggleDeg: 8, wiggleHz: 8,                      // rump wiggle while roomcat tell.phase === 'wiggle' (phase from tell.s)
+  freezeSquash: 0.9, freezeSquashCanvas: 0.8,     // slight squash on stalk 'freeze' and the tell 'settle' (canvas: crouch depth)
+  bowS: 1.2, bowDeg: 9, bowSquash: 0.85, bowStretch: 1.06, // stretch = a play-bow: front down, rump up, then slow rise
+});
+const MOTION_POSES_WALK = new Set(['walk', 'run', 'trot']);
+const SIDE_SPRITES = new Set(['side', 'left', 'right']);
 export const HOLD_MAX_S = 0.25; // cat-billboard holdFrame: the longest a kitten keeps a stale atlas frame while the next sheet uploads
 
 /** Create one billboard. Returns { root, quad, shadow, setView, setPose, setShadow }:
@@ -190,24 +199,32 @@ export function createCatBillboard(opts = {}) {
   let pose = 'sit';
   let jx = 1, jy = 1; // P0a juice (fx.js juiceStep): squash & stretch multipliers, applied about the paws
   let frame = null;   // P0a atlas mode (Design's VR1 sprites): the current atlas frame { sizeM, centerM, liftM, flipX, uv }
+  let mBob = 0, mRz = 0, mSx = 1, mSy = 1, mFreeze = false, bobPh = 0, bowSince = null, lastMT = null; // Q-GE2 gait motion
+  const quads = [quad, fadeQuad]; // hoisted: apply() runs every frame while a kitten moves
   let holdSince = null; // perf: sim time the current frame started being HELD (its successor's sheet not resident yet), see holdFrame
   const apply = () => {
     const lean = pose === 'carried' ? 18 : pose === 'poof' ? -12 : pose === 'fall' ? 8 : 0;
     if (frame) {
-      // atlas mode: the frame is already the pose's drawing (flip baked into its UVs); only the juice squashes it, about the paws
+      // atlas mode: the frame is already the pose's drawing (flip baked into its UVs); the juice + Q-GE2 gait squash it, about the paws
       const w = frame.sizeM[0] * ART_SCALE / KITTEN_HEIGHT_M, h = frame.sizeM[1] * ART_SCALE / KITTEN_HEIGHT_M;
-      quad.scale.set(w * jx, h * jy, 1);
-      quad.position.set(frame.centerM[0] * ART_SCALE * jx, (frame.centerM[1] * ART_SCALE + frame.liftM) * jy, 0);
-      quad.rotation.set(-view.tiltDeg * DEG2RAD, 0, (-view.rotDeg + lean) * DEG2RAD);
+      const sx = jx * mSx, sy = jy * mSy * (mFreeze ? GAIT.freezeSquash : 1);
+      quad.scale.set(w * sx, h * sy, 1);
+      quad.position.set(frame.centerM[0] * ART_SCALE * sx, (frame.centerM[1] * ART_SCALE + frame.liftM) * sy + mBob, 0);
+      quad.rotation.set(-view.tiltDeg * DEG2RAD, 0, (-view.rotDeg + lean) * DEG2RAD + bowRz(frame.flipX) + mRz);
       return;
     }
-    const squash = (pose === 'nap' || pose === 'loaf' ? 0.62 : pose === 'crouch' || pose === 'eat' ? 0.8 : pose === 'stare' || pose === 'beg' ? 1.08 : 1) * jy;
-    for (const q of [quad, fadeQuad]) {
-      q.scale.set((view.flipX ? -1 : 1) * jx, squash, 1);
-      q.position.set(0, (KITTEN_HEIGHT_M * squash) / 2, q === fadeQuad ? -0.001 : 0);
-      q.rotation.set(-view.tiltDeg * DEG2RAD, 0, (-view.rotDeg + lean) * DEG2RAD);
+    let base = pose === 'nap' || pose === 'loaf' ? 0.62 : pose === 'crouch' || pose === 'eat' ? 0.8 : pose === 'stare' || pose === 'beg' ? 1.08 : 1;
+    if (mFreeze && base > GAIT.freezeSquashCanvas) base = GAIT.freezeSquashCanvas; // never deeper than the crouch
+    const squash = base * jy * mSy;
+    for (const q of quads) {
+      q.scale.set((view.flipX ? -1 : 1) * jx * mSx, squash, 1);
+      q.position.set(0, (KITTEN_HEIGHT_M * squash) / 2 + mBob, q === fadeQuad ? -0.001 : 0);
+      q.rotation.set(-view.tiltDeg * DEG2RAD, 0, (-view.rotDeg + lean) * DEG2RAD + bowRz(view.flipX) + mRz);
     }
   };
+  // play-bow tilt (side views only): the head end goes down. Side art faces right unflipped -> clockwise (-z)
+  let bowE = 0;
+  const bowRz = (flip) => (bowE > 0 && SIDE_SPRITES.has(view.sprite) ? -(flip ? -1 : 1) * GAIT.bowDeg * bowE * DEG2RAD : 0);
   const uvAttr = quad.geometry.attributes.uv;
   /** W3: pick the texture for (sprite, pose) through cat-sprites and run the crossfade (nowMs from the host clock) */
   const setSprite = (nowMs) => {
@@ -229,6 +246,22 @@ export function createCatBillboard(opts = {}) {
     root, quad, shadow,
     setView(v) { view.sprite = v.sprite; view.flipX = !!v.flipX; view.rotDeg = v.rotDeg || 0; view.tiltDeg = v.tiltDeg || 0; apply(); },
     setPose(p) { if (p !== pose) { pose = p; apply(); } },
+    /** Q-GE2 gait render, once per frame after setPose: speedMps (roomcat state speed, eased), tell (state tell { phase, s } | null),
+     *  stalk ('freeze' | 'burst' | null), tS = sim seconds. Walk / run bob 2-3 mm from a speed-integrated phase; rump wiggle
+     *  +-8 deg at 8 Hz from tell.s (deterministic); slight squash on the stalk freeze and the tell settle; pose 'stretch' = a
+     *  1.2 s play-bow (front down, rump up, squash 0.85, ease in / out) on the idle frame, never the crouch. */
+    setMotion(speedMps, tell, stalk, tS) {
+      const ts = Number(tS) || 0, dt = lastMT == null ? 0 : Math.min(0.1, Math.max(0, ts - lastMT)); lastMT = ts;
+      const v = speedMps > 0 ? speedMps : 0;
+      if (v > GAIT.bobMinMps && MOTION_POSES_WALK.has(pose)) bobPh = (bobPh + dt * v / GAIT.bobStrideM) % 1; else bobPh = 0;
+      const bob = bobPh ? GAIT.bobM * Math.abs(Math.sin(Math.PI * 2 * bobPh)) : 0;
+      const wig = tell && tell.phase === 'wiggle' ? GAIT.wiggleDeg * DEG2RAD * Math.sin(Math.PI * 2 * GAIT.wiggleHz * (Number(tell.s) || 0)) : 0;
+      const frz = stalk === 'freeze' || !!(tell && tell.phase === 'settle');
+      if (pose === 'stretch') { if (bowSince == null) bowSince = ts; const k = (ts - bowSince) / GAIT.bowS; bowE = k >= 1 ? 0 : Math.sin(Math.PI * Math.max(0, k)); }
+      else { bowSince = null; bowE = 0; }
+      const sy = 1 - (1 - GAIT.bowSquash) * bowE, sx = 1 + (GAIT.bowStretch - 1) * bowE;
+      if (bob !== mBob || wig !== mRz || frz !== mFreeze || sy !== mSy || sx !== mSx || bowE > 0) { mBob = bob; mRz = wig; mFreeze = frz; mSy = sy; mSx = sx; apply(); }
+    },
     /** P0a: squash & stretch (sx wider, sy taller) from fx.js; cheap when unchanged */
     setSquash(sx, sy) { if (Math.abs(sx - jx) > 1e-4 || Math.abs(sy - jy) > 1e-4) { jx = sx; jy = sy; apply(); } },
     /** P0a atlas mode: show atlas frame f (vr/src/art/atlas.js getFrame) from texture tex (one per cat atlas file). The quad's UVs

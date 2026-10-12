@@ -85,6 +85,21 @@ export const ROOMCAT_TUNING = Object.freeze({
   curiousM: 2.5, curiousAgeS: 3, curiousP: 0.45, curiousStopM: 0.3, lookS0: 1.0, lookS1: 2.5, curiousDetourCdS: 2, hopOverN: 400, smoothLook: 10,
   homeM: 2.3, homeP: 0.6, // homeM 1.6 -> 2.3 (GE1-B 2026-10-11, owner: "play zone is small"): the kittens' home circle doubles in area; still a walk back, in view
   stalkM: 0.55, stalkV: 0.45,
+  // Q-GE1 2026-10-12 cat movement quick wins (design/briefs/CAT-MOVEMENT-B.md A2-A5; owner #4 "kitten / cat movement looks weird"):
+  // speeds EASE (accelUp / accelDown m/s^2; a stop settles over sqrt(2 a d), never a snap), the facing TURNS at turnDegS (beyond
+  // turnGoDeg off its heading the cat pivots in place, inside it moves ALONG its facing and curves in; arriveM = the final snap),
+  // a walk starts with a lookLeadS look at the goal (the head leads) and a long wander leg (> sniffMinM) stops to sniff halfway
+  // (sniffP, sniffS0..S1); the STALK is bursts (stalkBurstS0..S1 at stalkV) and crouched freezes (stalkFreezeS0..S1, eyes on the
+  // dot); the tell (tellS, unchanged) = crouch-settle (tellS - wiggleS) then the rump WIGGLE (wiggleS; state().cats[].tell.phase drives the
+  // host's procedural wiggle: no extra commit time, GE1-B's catch timing stands),
+  // and a dot that reversed during the wiggle makes the kitten re-wiggle once with chance abortP (at most wiggleMaxN wiggles: it
+  // does not adjust in flight). All seeded (prng): the replay hash still pins it. Instant turns remain for a hop launch and a lean-in.
+  // creepV / creepDotV: inside stalkM a SLOW dot (under creepDotV m/s over leadWinS) is crept up on at creepV in bursts + freezes (freezes only
+  // beyond freezeMinM of the dot: the last stretch is one steady creep into the crouch, so a briefly parked dot is still pounced); a dot on
+  // the move is run down at stalkV without freezes (a creep never closes on a 0.5 m/s dot; the roomcat-cats "no run inside stalkM" rule holds)
+  creepV: 0.45, creepDotV: 0.1,
+  accelUp: 1.2, accelDown: 3, turnDegS: 500, turnGoDeg: 30, arriveM: 0.006, lookLeadS: 0.15, sniffP: 0.5, sniffMinM: 0.7, sniffS0: 0.3, sniffS1: 0.6,
+  stalkBurstS0: 0.3, stalkBurstS1: 0.6, stalkFreezeS0: 0.2, stalkFreezeS1: 0.4, freezeMinM: 0.45, wiggleS: 0.25, abortP: 0.25, abortV: 0.15, wiggleMaxN: 2,
   dozeAfterS: 20, dozeS0: 6, dozeS1: 12,
   // Review CH S3 (hand-tracking jitter): the pounce LEAD reads the dot's velocity over the last leadWinS (a ring of per-step dot
   // positions), not over the 0.25 s tell: 3 mm of joint jitter through the ray is 2-5 cm of random "travel" per tell (x1.24 lead = a
@@ -181,7 +196,19 @@ function rcCross(px, pz, qx, qz, a, b) {
   const d1 = o(a.x, a.z, b.x, b.z, px, pz), d2 = o(a.x, a.z, b.x, b.z, qx, qz), d3 = o(px, pz, qx, qz, a.x, a.z), d4 = o(px, pz, qx, qz, b.x, b.z);
   return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
 }
-function rcFace(c, dx, dz) { const l = rcLen(dx, dz); if (l > 1e-6) { c.fx = dx / l; c.fz = dz / l; } }
+/** the facing TARGET (Q-GE1): rcTurn eases c.fx / c.fz toward it at turnDegS every grounded step */
+function rcFace(c, dx, dz) { const l = rcLen(dx, dz); if (l > 1e-6) { c.tfx = dx / l; c.tfz = dz / l; } }
+/** an instant turn (a hop launch, a toss, a stroke's lean-in) */
+function rcFaceNow(c, dx, dz) { rcFace(c, dx, dz); c.fx = c.tfx; c.fz = c.tfz; }
+const RC_TURN = (() => { const a = ROOMCAT_TUNING.turnDegS * STEP_S * Math.PI / 180; return { c: Math.cos(a), s: Math.sin(a), go: Math.cos(ROOMCAT_TUNING.turnGoDeg * Math.PI / 180) }; })(); // (constants at load, no trig per step)
+/** one step of the turn toward the target (at most turnDegS x STEP_S); returns the cosine facing . target AFTER it (1 = aligned) */
+function rcTurn(c) {
+  const d = c.fx * c.tfx + c.fz * c.tfz;
+  if (d >= RC_TURN.c) { c.fx = c.tfx; c.fz = c.tfz; return 1; }
+  const px = -c.fz, pz = c.fx, sg = c.tfx * px + c.tfz * pz >= 0 ? 1 : -1; // (an exact about-face turns left: deterministic)
+  const nx = c.fx * RC_TURN.c + px * RC_TURN.s * sg, nz = c.fz * RC_TURN.c + pz * RC_TURN.s * sg, l = rcLen(nx, nz);
+  c.fx = nx / l; c.fz = nz / l; return c.fx * c.tfx + c.fz * c.tfz;
+}
 
 /** Create a session. opts: { room (createRoom), seed, cats: number | [{ id, size, napSurf? }], size = 'kitten', arc = true }.
  *  napSurf (W4 kitten memory): the id of the surface this cat heads to first at nap time when it is free (its
@@ -207,7 +234,7 @@ export function createRoomSession(opts = {}) {
   list.forEach((d, i) => {
     const size = ROOMCAT_SIZES[d.size || opts.size || 'kitten'] ? (d.size || opts.size || 'kitten') : 'kitten';
     const c = { id: String(d.id != null ? d.id : 'k' + (i + 1)), size, lim: ROOMCAT_SIZES[size], x: 0, y: 0, z: 0, surf: null, mode: 'inbox', pose: 'inbox',
-      fx: 0, fz: 1, t: 0, plan: [], hop: null, fly: null, poof: false, bond: 0, purr: 0, petCd: 0, interest: prng.chance(T.interest),
+      fx: 0, fz: 1, tfx: 0, tfz: 1, v: 0, walked: false, stalkT: 0, stalkOn: false, wigN: 0, wigVx: 0, wigVz: 0, t: 0, plan: [], hop: null, fly: null, poof: false, bond: 0, purr: 0, petCd: 0, interest: prng.chance(T.interest),
       goal: 'wander', nap: null, eat: 0, hand: null, onT: 0, wave: Math.floor(i / T.waveSize), slot: i % T.waveSize, cool: 0, lastHop: 0,
       tell: 0, tellKind: null, tellX: 0, tellZ: 0, pin: 0, mute: 0, leapCool: 0, leap: null,
       hearts: 0, heartT: 0, treatCd: 0, peeked: false, detourCd: 0, detourTo: null, dotX0: 0, dotZ0: 0, hardT: [], sulk: 0, tossHard: false, nmTick: -1e9,
@@ -227,7 +254,7 @@ export function createRoomSession(opts = {}) {
     const y0 = c.y, apex = Math.max(y0, y) + clear;
     let vy = Math.sqrt(2 * g * (apex - y0)), dur = vy / g + Math.sqrt(2 * (apex - y) / g);
     if (minDur > dur) { dur = minDur; vy = (y - y0 + 0.5 * g * dur * dur) / dur; }
-    rcFace(c, x - c.x, z - c.z);
+    rcFaceNow(c, x - c.x, z - c.z);
     c.hop = { x0: c.x, y0, z0: c.z, x1: x, y1: y, z1: z, vy, g, dur, n: Math.max(6, Math.ceil(dur / STEP_S)), k: 0, to, kind: pose };
     c.mode = 'hop'; c.pose = pose; c.surf = null; c.lastHop = s.tick;
   };
@@ -272,21 +299,61 @@ export function createRoomSession(opts = {}) {
       if (!pair) return false;
       picks.push(pair); cur = pair.b; cs = e.to;
     }
-    goalXZ.x = x; goalXZ.z = z;
-    if (!roomLineLegal(room, cs, cur, goalXZ)) return false;
+    goalXZ.x = x; goalXZ.z = z; let tail = null;
+    if (!roomLineLegal(room, cs, cur, goalXZ)) { tail = pathOn(cs, cur, x, z); if (!tail) return false; } // (Q-GE1: the last leg may detour over the landing surface's grid)
     const plan = [];
     for (let i = 0; i < route.length; i++) { const pair = picks[i]; plan.push({ k: 'walk', x: pair.a.x, z: pair.a.z }, { k: 'hop', to: route[i].to, x: pair.b.x, z: pair.b.z }); }
-    plan.push({ k: 'walk', x, z }); c.plan = plan; return true;
+    if (tail) for (const w of tail) plan.push({ k: 'walk', x: w.x, z: w.z }); else plan.push({ k: 'walk', x, z });
+    c.plan = plan; return true;
   };
   // walk toward (x, z) on the current surface; true = arrived, false = moving, null = blocked
-  const walk = (c, x, z, speed) => {
-    const dx = x - c.x, dz = z - c.z, d = rcLen(dx, dz), st = speed * STEP_S;
-    rcFace(c, dx, dz);
-    if (d <= st) { if (!legalAt(c, x, z)) return null; c.x = x; c.z = z; return true; }
-    const nx = c.x + dx / d * st, nz = c.z + dz / d * st;
+  // Q-GE1: the speed EASES (accelUp / accelDown, and it settles into the stop), the facing turns at turnDegS: beyond turnGoDeg off the
+  // goal the cat pivots in place, inside it moves ALONG its facing (a curve in; it always faces its travel), the last arriveM snaps
+  const walk = (c, x, z, speed, hard) => {
+    const dx = x - c.x, dz = z - c.z, d = rcLen(dx, dz);
+    rcFace(c, dx, dz); c.walked = true;
+    const al = rcTurn(c);
+    let v = Math.min(speed, c.v + T.accelUp * STEP_S);
+    const vs = Math.sqrt(2 * T.accelDown * d); if (v > vs) v = Math.max(vs, Math.min(speed, 0.08)); // settle: never faster than the stop allows
+    if (v < c.v - T.accelDown * STEP_S) v = c.v - T.accelDown * STEP_S; // ... and never a harder brake than accelDown
+    if (hard && v > speed) v = speed; // (a stalk never exceeds stalkV: rcChaseV already slowed the run into the band)
+    if (al < RC_TURN.go) { // off-heading: a SKID: it keeps sliding along its facing while it brakes and turns (a stop from a run is never instant)
+      v = Math.max(0, c.v - T.accelDown * STEP_S); if (hard && v > speed) v = speed; const sk = v * STEP_S;
+      if (sk > 0 && legalAt(c, c.x + c.fx * sk, c.z + c.fz * sk)) { c.x += c.fx * sk; c.z += c.fz * sk; c.v = v; } else c.v = 0;
+      return false;
+    }
+    const st = v * STEP_S;
+    if (d <= Math.max(st, T.arriveM)) { if (!legalAt(c, x, z)) return null; c.x = x; c.z = z; c.fx = c.tfx; c.fz = c.tfz; c.v = v; return true; }
+    const nx = c.x + c.fx * st, nz = c.z + c.fz * st;
     if (!legalAt(c, nx, nz)) return null;
-    c.x = nx; c.z = nz; return false;
+    c.x = nx; c.z = nz; c.v = v; return false;
   };
+  // Q-GE1: a wander leg = a look toward the goal first (lookLeadS: the head leads the body), then the walk, with a sniff stop halfway
+  // on a long calm leg (sniffP over sniffMinM; the midpoint of a legal straight line is legal)
+  const rcWalkPlan = (c, x, z, calm) => {
+    const plan = [{ k: 'look', n: RC_T(T.lookLeadS), x, z }];
+    if (calm && rcLen(x - c.x, z - c.z) > T.sniffMinM && prng.chance(T.sniffP)) plan.push({ k: 'walk', x: (c.x + x) / 2, z: (c.z + z) / 2 }, { k: 'pause', n: RC_T(prng.range(T.sniffS0, T.sniffS1)), pose: 'stand', sniff: true });
+    plan.push({ k: 'walk', x, z }); return plan;
+  };
+  /** the dot's velocity over the last `back` steps of the ring (default leadWinS) into out = { x, z } (0 when the ring has not seen this surface that far back) */
+  const rcDotVel = (L, out, back) => {
+    const n = back > 0 && back < s.laserHistN ? back : s.laserHistN - 1, k = (s.tick - n + s.laserHistN) % s.laserHistN, oldOk = s.laserHS[k] === L.surf;
+    if (!oldOk) { out.x = 0; out.z = 0; return out; }
+    out.x = (L.x - s.laserHX[k]) / (n * STEP_S); out.z = (L.z - s.laserHZ[k]) / (n * STEP_S); return out;
+  };
+  const dotV = { x: 0, z: 0 };
+  /** a grounded cat that did not walk this step: it slides on along its facing while it brakes at accelDown (never an instant stop), and
+   *  its facing keeps turning toward the target (rcTurn); airborne / held / boxed cats are left alone */
+  const rcSettle = (c) => {
+    if (c.mode === 'hop' || c.mode === 'fly' || c.mode === 'carried' || c.mode === 'inbox' || c.mode === 'onhand' || !c.surf) { c.v = 0; return; }
+    if (c.v > 0) { c.v = Math.max(0, c.v - T.accelDown * STEP_S); const sk = c.v * STEP_S; if (sk > 0 && legalAt(c, c.x + c.fx * sk, c.z + c.fz * sk)) { c.x += c.fx * sk; c.z += c.fz * sk; } else c.v = 0; }
+    rcTurn(c);
+  };
+  /** is the dot on the move (over creepDotV m/s over the ring)? a slow one is crept up on, a moving one run down inside the band */
+  const rcFastDot = (L) => { rcDotVel(L, dotV); return rcLen(dotV.x, dotV.z) > T.creepDotV; };
+  /** the chase speed at distance d from dot L: inside the band creepV (slow dot) or stalkV (moving dot); outside it the run slows
+   *  (accelDown) so it ENTERS the band at that speed */
+  const rcChaseV = (c, d, L) => { const vb = rcFastDot(L) ? T.stalkV : T.creepV; return d <= T.stalkM ? vb : Math.min(c.lim.run, Math.sqrt(vb * vb + 2 * T.accelDown * (d - T.stalkM))); };
   // same-surface detour (P0a fix round): a path over the surface's sample grid (neighbours = samples within 2.5 grid steps
   // joined by a legal straight line; built once per surface, cached), BFS from the sample nearest the cat to the sample nearest
   // the goal, then line-of-sight smoothing. Returns the waypoints [{ x, z }...] (the goal last) or null when no path exists.
@@ -340,8 +407,8 @@ export function createRoomSession(opts = {}) {
   const goalXZ2 = (x, z) => { goalXZ.x = x; goalXZ.z = z; return goalXZ; };
   const rcLegs = (w) => w.map((p) => (p.hop ? { k: 'hop', to: p.to, x: p.x, z: p.z } : { k: 'walk', x: p.x, z: p.z }));
   // walk straight, or when blocked plan a detour (plan legs); returns walk()'s result, or 'detour' when a detour plan was set
-  const walkOrDetour = (c, x, z, speed, goal) => {
-    const r = walk(c, x, z, speed); if (r !== null) return r;
+  const walkOrDetour = (c, x, z, speed, goal, hard) => {
+    const r = walk(c, x, z, speed, hard); if (r !== null) return r;
     if (c.detourCd > 0) return null; c.detourCd = RC_T(T.detourCdS);
     const w = detour(c, x, z); if (!w) return null;
     c.plan = rcLegs(w); c.goal = goal; c.detourTo = { x, z }; return 'detour';
@@ -390,7 +457,7 @@ export function createRoomSession(opts = {}) {
     c.tossHard = hard; if (hard) { c.hardT.push(s.tick); while (c.hardT.length && s.tick - c.hardT[0] > RC_T(T.hardWindowS)) c.hardT.shift(); } else c.hardT.length = 0; // (a gentle toss forgives)
     if (hit && roomLegalAt(room, hit.id, D.x, D.z)) {
       c.fly = { x: c.x, y: c.y, z: c.z, vx, vy, vz, g, h: c.lim.h, n, k: 0, surf: hit.id, x1: D.x, y1: hit.y, z1: D.z };
-      c.mode = 'fly'; c.pose = c.poof ? 'poof' : 'fall'; c.surf = null; rcFace(c, vx, vz);
+      c.mode = 'fly'; c.pose = c.poof ? 'poof' : 'fall'; c.surf = null; rcFaceNow(c, vx, vz);
     } else {
       const L = roomNearestLegal(room, { x: D.x, y: Math.max(c.y, D.y), z: D.z });
       // the fallback starts at the release point (feet); it never passes through a wall: the target is inside the room
@@ -422,7 +489,7 @@ export function createRoomSession(opts = {}) {
         if (c.mode === 'carried' || c.mode === 'inbox' || c.mode === 'hop' || c.mode === 'fly') continue;
         const b = { x: c.x, y: c.y + c.lim.h * 0.8, z: c.z };
         if (d3(ev.p, b) <= T.petR) {
-          c.purr = RC_T(1.2); rcFace(c, ev.p.x - c.x, ev.p.z - c.z); // leans into the hand: turns to it
+          c.purr = RC_T(1.2); rcFaceNow(c, ev.p.x - c.x, ev.p.z - c.z); // leans into the hand: turns to it (instant: the head is already there)
           if (c.petCd <= 0) { c.bond++; c.played++; c.petCd = RC_T(T.petCdS); emit({ type: 'purr', cat: c.id, hearts: hearts(c, 1), bond: c.bond }); }
           if (c.mode !== 'nap' && c.mode !== 'onhand' && c.mode !== 'pin') { c.mode = 'idle'; c.pose = 'petted'; c.plan = []; c.t = RC_T(1.2); }
         }
@@ -514,12 +581,19 @@ export function createRoomSession(opts = {}) {
         if (d <= T.pounceR && c.cool <= 0) {
           // GE1-B: the reaction delay: once per approach the kitten may freeze (stare at the dot) before the crouch tell
           if (!c.hes) { c.hes = true; if (prng.chance(T.hesitateP)) { c.mode = 'idle'; c.pose = 'stare'; c.plan = [{ k: 'stare', n: RC_T(prng.range(T.hesitateS0, T.hesitateS1)) }]; rcFace(c, L.x - c.x, L.z - c.z); return; } }
-          c.hes = false; c.mode = 'tell'; c.pose = 'crouch'; c.tell = RC_T(T.tellS); c.tellKind = 'pounce'; c.tellX = L.x; c.tellZ = L.z; c.plan = []; rcFace(c, L.x - c.x, L.z - c.z); emit({ type: 'tell', cat: c.id, kind: 'pounce' }); return;
+          c.hes = false; c.mode = 'tell'; c.pose = 'crouch'; c.tell = RC_T(T.tellS - T.wiggleS); c.wigN = 0; c.tellKind = 'pounce'; c.tellX = L.x; c.tellZ = L.z; c.plan = []; c.stalkT = 0; c.stalkOn = false; rcFace(c, L.x - c.x, L.z - c.z); emit({ type: 'tell', cat: c.id, kind: 'pounce' }); return;
         }
         if (d > T.pounceR) c.hes = false; // a new approach may hesitate again
         const stalk = d <= T.stalkM; // inside stalkM the chase SLOWS to a stalk (low walk, eyes on the dot) before the crouch tell
-        c.goal = 'chase'; c.mode = stalk ? 'stalk' : 'run'; c.pose = stalk ? 'walk' : 'run';
-        if (walkOrDetour(c, L.x, L.z, stalk ? T.stalkV : c.lim.run, 'chase') === null) { c.mode = 'idle'; c.pose = 'stare'; c.t = RC_T(0.25); }
+        c.goal = 'chase';
+        if (stalk && !rcFastDot(L)) { // Q-GE1: a slow dot is CREPT up on, stop-and-go: a burst at creepV, then a crouched FREEZE with the eyes on the dot (seeded lengths)
+          if (d <= T.freezeMinM && c.stalkOn) c.stalkT = 2; // (the final stretch: one steady creep into the crouch; a freeze under way still ends on its own clock)
+          if (c.stalkT <= 0) { c.stalkOn = !c.stalkOn; c.stalkT = RC_T(c.stalkOn ? prng.range(T.stalkBurstS0, T.stalkBurstS1) : prng.range(T.stalkFreezeS0, T.stalkFreezeS1)); }
+          c.stalkT--;
+          if (!c.stalkOn) { c.mode = 'stalk'; c.pose = 'crouch'; if (c.v > T.stalkV) c.v = T.stalkV; rcFace(c, L.x - c.x, L.z - c.z); return; } // (the freeze: rcSettle slides it to a halt, never faster than a stalk)
+        } else { c.stalkT = 0; c.stalkOn = true; } // (outside the band, or a dot on the move inside it: a run / run-down, one long burst; the creep on a parked dot then OPENS with a freeze: notice, freeze, creep, crouch)
+        c.mode = stalk ? 'stalk' : 'run'; c.pose = stalk ? 'walk' : 'run';
+        if (walkOrDetour(c, L.x, L.z, rcChaseV(c, d, L), 'chase', stalk) === null) { c.mode = 'idle'; c.pose = 'stare'; c.t = RC_T(0.25); }
         return;
       }
       if (planTo(c, L.surf, L.x, L.z)) { c.goal = 'chase'; c.t = RC_T(0.6); return; }
@@ -531,7 +605,7 @@ export function createRoomSession(opts = {}) {
       // big leap: a fast tip + a reachable HIGHER legal surface within leapReach of the tip -> tell (crouch) then hop
       if (s.wand.speed > T.bigLeapV && c.leapCool <= 0 && c.cool <= 0 && c.surf && rcLen(W.x - c.x, W.z - c.z) <= T.batR + T.leapRun) {
         const leap = rcLeapPick(c, s.wand.p);
-        if (leap) { c.leap = leap; c.mode = 'tell'; c.pose = 'crouch'; c.tell = RC_T(T.leapTellS); c.tellKind = 'leap'; c.plan = []; rcFace(c, leap.a.x - c.x, leap.a.z - c.z); emit({ type: 'tell', cat: c.id, kind: 'leap' }); return; }
+        if (leap) { c.leap = leap; c.mode = 'tell'; c.pose = 'crouch'; c.tell = RC_T(T.leapTellS); c.wigN = 0; c.tellKind = 'leap'; c.plan = []; rcFace(c, leap.a.x - c.x, leap.a.z - c.z); emit({ type: 'tell', cat: c.id, kind: 'leap' }); return; }
       }
       if (c.surf === W.surf && rcLen(W.x - c.x, W.z - c.z) <= T.batR) {
         if (c.cool <= 0) { const clear = Math.max(0.05, Math.min(0.3, s.wand.p.y - c.y - c.lim.h)); startHop(c, c.surf, c.x, c.y, c.z, clear, 'bat'); c.cool = RC_T(0.7); return; }
@@ -569,13 +643,13 @@ export function createRoomSession(opts = {}) {
     if (!zoom && rcLen(s.box.x - c.x, s.box.z - c.z) > T.homeM && prng.chance(T.homeP)) {
       let best = null, bd = Infinity; // of 6 random samples of this surface, the one nearest the box spot with a legal line (a step home, not a teleport)
       for (let i = 0; i < 6; i++) { const p = prng.pick(surf.samples); const d = rcLen(p.x - s.box.x, p.z - s.box.z); if (d < bd && d < rcLen(c.x - s.box.x, c.z - s.box.z) - 0.3 && rcLen(p.x - c.x, p.z - c.z) <= T.wanderMaxM * 1.5 && rcClear(p.x, p.z) && rcSegClear(c.x, c.z, p.x, p.z) && roomLineLegal(room, c.surf, c, p)) { bd = d; best = p; } }
-      if (best) { c.plan = [{ k: 'walk', x: best.x, z: best.z }, { k: 'pause', n: RC_T(prng.range(T.pauseS0, T.pauseS1)), pose: 'stand' }]; c.goal = 'wander'; return; }
+      if (best) { c.plan = rcWalkPlan(c, best.x, best.z, true); c.plan.push({ k: 'pause', n: RC_T(prng.range(T.pauseS0, T.pauseS1)), pose: 'stand' }); c.goal = 'wander'; return; }
     }
     const r = prng.next();
     if (r < (zoom ? 0.75 : 0.4)) {
       for (let i = 0; i < 6; i++) {
         const p = prng.pick(surf.samples); if (!zoom && rcLen(p.x - c.x, p.z - c.z) > T.wanderMaxM) continue;
-        if (rcClear(p.x, p.z) && rcSegClear(c.x, c.z, p.x, p.z) && roomLineLegal(room, c.surf, c, p)) { c.plan = [{ k: 'walk', x: p.x, z: p.z }]; if (!zoom) c.plan.push({ k: 'pause', n: RC_T(prng.range(T.pauseS0, T.pauseS1)), pose: 'stand' }); c.goal = zoom ? 'zoom' : 'wander'; return; }
+        if (rcClear(p.x, p.z) && rcSegClear(c.x, c.z, p.x, p.z) && roomLineLegal(room, c.surf, c, p)) { c.plan = rcWalkPlan(c, p.x, p.z, !zoom); if (!zoom) c.plan.push({ k: 'pause', n: RC_T(prng.range(T.pauseS0, T.pauseS1)), pose: 'stand' }); c.goal = zoom ? 'zoom' : 'wander'; return; }
       }
     } else if (r < (zoom ? 0.95 : 0.4 + T.hopP)) {
       const hops = roomHops(room, c.surf, c.lim);
@@ -675,7 +749,7 @@ export function createRoomSession(opts = {}) {
           for (let i = 0; i < 12 && !L; i++) {
             let ux = prng.next() * 2 - 1, uz = prng.next() * 2 - 1; const l = rcLen(ux, uz); if (l < 0.2 || l > 1) continue; ux /= l; uz /= l;
             const dd = prng.range(0.3, 0.55), x = s.box.x + ux * dd, z = s.box.z + uz * dd;
-            if (roomLegalAt(room, s.box.surf, x, z)) L = { x, z };
+            if (roomLegalAt(room, s.box.surf, x, z) && rcClear(x, z)) L = { x, z }; // (Q-GE1: never out of the box onto the player's feet, CH M1)
           }
           if (!L) { const p = roomNearestLegal(room, { x: s.box.x + 0.4, y: s.box.y, z: s.box.z }); L = { x: p.x, z: p.z }; }
           startHop(c, s.box.surf, L.x, s.box.y, L.z, T.boxH, 'climb'); emit({ type: 'box_hop_out', cat: c.id, n: c.wave * T.waveSize + c.slot + 1 });
@@ -724,7 +798,20 @@ export function createRoomSession(opts = {}) {
     if (c.mode === 'nap') { c.pose = 'nap'; return; }
     //: tell (crouch, facing the dot) then launch; pin the caught dot, then the mute starts when the pin ENDS
     if (c.mode === 'tell') {
-      if (c.tell > 0) { c.tell--; c.pose = 'crouch'; if (c.tellKind === 'pounce' && s.laser) rcFace(c, s.laser.x - c.x, s.laser.z - c.z); return; }
+      c.pose = 'crouch'; if (c.tellKind === 'pounce' && s.laser) rcFace(c, s.laser.x - c.x, s.laser.z - c.z);
+      if (c.tell > 0) {
+        c.tell--;
+        // Q-GE1: the crouch-settle (tellS) is done: the rump WIGGLE (wiggleS; the dot's velocity now is remembered for the abort test)
+        if (c.tell === 0 && c.tellKind === 'pounce' && c.wigN === 0) { c.wigN = 1; c.tell = RC_T(T.wiggleS); if (s.laser) { rcDotVel(s.laser, dotV, RC_T(T.aimErrS)); c.wigVx = dotV.x; c.wigVz = dotV.z; } } // (the STALE pounce still commits to the dot at the tell start, as GE1-B measured it)
+        return;
+      }
+      // the wiggle ended: a dot that REVERSED during it (its velocity over aimErrS now against the one at the wiggle start, both over abortV) makes
+      // the kitten wobble and wiggle once more with chance abortP (no in-flight correction: it commits to what it saw)
+      if (c.tellKind === 'pounce' && c.wigN >= 1 && c.wigN < T.wiggleMaxN && s.laser) {
+        rcDotVel(s.laser, dotV, RC_T(T.aimErrS)); // (over aimErrS, the eyes' window: a reversal inside a 0.35 s wiggle shows)
+        const v0 = rcLen(c.wigVx, c.wigVz), v1 = rcLen(dotV.x, dotV.z);
+        if (v0 > T.abortV && v1 > T.abortV && c.wigVx * dotV.x + c.wigVz * dotV.z < 0 && prng.chance(T.abortP)) { c.wigN++; c.tell = RC_T(T.wiggleS); c.wigVx = dotV.x; c.wigVz = dotV.z; return; }
+      }
       rcTellEnd(c); return;
     }
     if (c.mode === 'pin') {
@@ -736,15 +823,16 @@ export function createRoomSession(opts = {}) {
     if (c.plan.length) {
       const leg = c.plan[0];
       if (leg.k === 'stare') { c.mode = 'idle'; c.pose = 'stare'; if (s.laser) rcFace(c, s.laser.x - c.x, s.laser.z - c.z); if (--leg.n <= 0) c.plan.shift(); return; }
-      if (leg.k === 'pause') { // the stand-and-look after a walk: faces the nearest recent hand (the player) when one is near
-        c.mode = 'idle'; c.pose = leg.pose || 'stand'; const hd = rcNearHand(c); if (hd) rcFace(c, hd.x - c.x, hd.z - c.z);
+      if (leg.k === 'look') { c.mode = 'idle'; c.pose = 'stand'; rcFace(c, leg.x - c.x, leg.z - c.z); if (--leg.n <= 0) c.plan.shift(); return; } // Q-GE1: the head leads: look at the goal before the walk
+      if (leg.k === 'pause') { // the stand-and-look after a walk: faces the nearest recent hand (the player) when one is near (a sniff stop keeps its heading)
+        c.mode = 'idle'; c.pose = leg.pose || 'stand'; const hd = leg.sniff ? null : rcNearHand(c); if (hd) rcFace(c, hd.x - c.x, hd.z - c.z);
         if (--leg.n <= 0) c.plan.shift(); return;
       }
       if (leg.k === 'walk') {
         const fast = c.goal === 'chase' || c.goal === 'zoom';
         const stalk = c.goal === 'chase' && s.laser && c.surf === s.laser.surf && rcLen(s.laser.x - c.x, s.laser.z - c.z) <= T.stalkM;
-        const r = walk(c, leg.x, leg.z, stalk ? T.stalkV : fast ? c.lim.run : c.lim.walk);
-        c.mode = stalk ? 'stalk' : fast ? 'run' : 'walk'; c.pose = stalk ? 'walk' : c.mode;
+        const r = walk(c, leg.x, leg.z, c.goal === 'chase' && s.laser && c.surf === s.laser.surf ? rcChaseV(c, rcLen(s.laser.x - c.x, s.laser.z - c.z), s.laser) : fast ? c.lim.run : c.lim.walk, stalk);
+        c.mode = stalk ? 'stalk' : fast ? 'run' : 'walk'; c.pose = stalk ? 'walk' : c.mode; if (stalk) c.stalkOn = true; // (a detour leg inside the band is a burst)
         if (r === true) c.plan.shift(); else if (r === null) { const rest = c.plan.slice(1); c.plan = []; const w = c.detourCd > 0 ? null : detour(c, leg.x, leg.z); if (w) { c.detourCd = RC_T(T.detourCdS); c.plan = rcLegs(w).concat(rest); } else { c.mode = 'idle'; c.pose = 'sit'; c.t = RC_T(0.3); } }
         // laser moved: re-think a chase every 0.5 s
         if (c.goal === 'chase' && (s.tick - c.lastHop) % 30 === 0 && s.laser && c.surf === s.laser.surf && !(c.detourTo && rcLen(s.laser.x - c.detourTo.x, s.laser.z - c.detourTo.z) < 0.25)) { c.plan = []; c.detourTo = null; } // (a detour plan survives while the dot stays near its goal)
@@ -790,7 +878,10 @@ export function createRoomSession(opts = {}) {
       phaseStep(); if (s.comboCd > 0) s.comboCd--;
       { const k = s.tick % s.laserHistN; if (s.laser) { s.laserHS[k] = s.laser.surf; s.laserHX[k] = s.laser.x; s.laserHZ[k] = s.laser.z; } else s.laserHS[k] = null; }
       if (s.phase !== was) emit({ type: 'phase', phase: s.phase }); // a pinch / openBox opens the box in apply, hence here
-      for (const c of s.cats) stepCat(c);
+      for (const c of s.cats) {
+        c.walked = false; stepCat(c);
+        if (!c.walked) rcSettle(c); // Q-GE1: a cat that stops (freeze, tell, stare, sit) slides to a halt along its facing at accelDown and turns toward its target over time
+      }
       s.tick++;
     },
     /** open the box now (host button / tests) */
@@ -800,13 +891,14 @@ export function createRoomSession(opts = {}) {
     state() {
       return {
         tick: s.tick, phase: s.phase, box: { ...s.box }, laser: s.laser && { ...s.laser }, wand: s.wand && { ...s.wand.at, tip: s.wand.p }, treat: s.treat && { ...s.treat.p, cat: s.treat.cat },
-        cats: s.cats.map((c) => ({ id: c.id, size: c.size, x: c.x, y: c.y, z: c.z, fx: c.fx, fz: c.fz, surf: c.surf, mode: c.mode, pose: c.pose, poof: c.poof, purr: c.purr > 0, bond: c.bond, hearts: c.hearts, full: c.treatCd > 0, sulk: c.sulk > 0, doze: c.mode === 'idle' && c.pose === 'nap', airborne: c.mode === 'hop' || c.mode === 'fly', support: c.mode === 'carried' || c.mode === 'onhand' ? 'hand' : c.surf })),
+        cats: s.cats.map((c) => ({ id: c.id, size: c.size, x: c.x, y: c.y, z: c.z, fx: c.fx, fz: c.fz, surf: c.surf, mode: c.mode, pose: c.pose, poof: c.poof, purr: c.purr > 0, bond: c.bond, hearts: c.hearts, full: c.treatCd > 0, sulk: c.sulk > 0, doze: c.mode === 'idle' && c.pose === 'nap', airborne: c.mode === 'hop' || c.mode === 'fly', support: c.mode === 'carried' || c.mode === 'onhand' ? 'hand' : c.surf,
+          speed: c.v, tell: c.mode === 'tell' ? { phase: c.wigN ? 'wiggle' : 'settle', n: c.wigN, s: c.tell * STEP_S } : null, stalk: c.mode === 'stalk' ? (c.stalkOn ? 'burst' : 'freeze') : null })), // Q-GE1: eased speed (m/s), the tell's phase (the host wiggles the rump in 'wiggle'), the stalk's burst / freeze
       };
     },
     hash() {
       const h = createHasher(); h.num(s.tick).str(s.phase).num(prng.getState() / 65536);
       h.num(s.box.y).num(s.box.open ? 1 : 0);
-      for (const c of s.cats) h.str(c.id).str(c.mode).str(c.pose).str(c.surf || '-').num(c.x).num(c.y).num(c.z).num(c.fx).num(c.fz).num(c.bond).num(c.poof ? 1 : 0).num(c.cool).num(c.mute).num(c.leapCool).num(c.treatCd).num(c.hearts).num(c.sulk).num(c.played);
+      for (const c of s.cats) h.str(c.id).str(c.mode).str(c.pose).str(c.surf || '-').num(c.x).num(c.y).num(c.z).num(c.fx).num(c.fz).num(c.bond).num(c.poof ? 1 : 0).num(c.cool).num(c.mute).num(c.leapCool).num(c.treatCd).num(c.hearts).num(c.sulk).num(c.played).num(c.v).num(c.tfx).num(c.tfz).num(c.wigN).num(c.stalkT);
       h.num(s.head.x).num(s.head.z).num(s.head.fx).num(s.head.fz);
       return h.digest();
     },

@@ -3,7 +3,7 @@
    PURE and engine-neutral: no DOM, no Date, no globals. The host hands in a localStorage-LIKE adapter ({ getItem(key),
    setItem(key, value) }, strings in / out) and the clock; node-tested in vr/test/visit-store.test.mjs with
    memoryStorage(). What is stored: ONE small JSON record under VISIT_STORE_KEY:
-     { v: 1, day, visit, memory? }  = the local calendar day of the last visit, its number and (W4, Legal) the
+     { v: 1, day, visit, memory?, furniture? }  = the local calendar day of the last visit, its number and (W4, Legal) the
      kitten memory `memory = { v, cats }`: per fixed-roster kitten id ONLY { bond (int 0-60), met (visit NUMBER, int),
      spot (null | { kind, label }: one word each from MEMORY_KINDS / MEMORY_LABELS) }, max 24 kittens. Nothing else,
      nothing sent anywhere (legal/SK-77-VR-COMPETITION.md 10, 10.1, 10.2; FOR-DEV): never anchors, coordinates,
@@ -13,6 +13,12 @@
    whitelist, applied on read AND write (return-visit.js sanitizeMemory adds the roster; writeVisit re-applies it to a
    memory it carries across beginVisit, so a tampered record never keeps arbitrary text: Code Review L W4 SHOULD 2).
    Were the gate ever closed again: writeVisit drops the field, return-visit.js keeps the memory in a session map.
+   FURNITURE (Q-GE2, Legal / FOR-DEV; gate FURNITURE_PERSIST, TRUE in the same build as the #privacy
+   sentence): `furniture = { v: 1, items: [[k, x, z, r], ...] }`, max 12: k = index into the fixed 6-piece wand.js
+   FURN_VR_KINDS, x / z = integer 10 cm cells on the PLAY RUG's own grid from the rug centre (|cell| <= 14 = the 2.8 m rug's
+   half-size), r = 0-7 (45 deg steps relative to the rug). Nothing else: no height, size, time, rug pose in the room,
+   anchors, planes, meshes or hand data. sanitizeFurniture is its ONE whitelist, on read AND write; while the gate is false
+   nothing about furniture is written (writeVisit / writeFurniture / return-visit.js writeMemoryRecord drop it).
    Build rule: only `export function` / `export const`; private names carry the `vs` prefix. */
 import { localDay, visitFor } from './end-card.js';
 
@@ -26,6 +32,12 @@ export const KITTEN_MEMORY_PERSIST = true;
 export const MEMORY_KINDS = Object.freeze(['floor', 'rug', 'seat', 'bed', 'table', 'shelf', 'perch']);
 export const MEMORY_LABELS = Object.freeze(['floor', 'rug', 'couch', 'bed', 'table', 'storage', 'shelf', 'desk', 'chair', 'other']);
 export const MEMORY_LIMITS = Object.freeze({ maxBond: 60, maxCats: 24, maxMet: 100000 });
+/** LEGAL GATE (/ FOR-DEV rule 1): TRUE only in the build whose vr/index.html #privacy carries the sentence
+ *  ("... and which toy furniture you put on the play rug and where, are saved ..."). False = nothing about furniture is
+ *  ever written (the pieces stay page-only). Every furniture storage function also takes an optional `gate` argument. */
+export const FURNITURE_PERSIST = true;
+/** rule 2: kinds = FURN_VR_KINDS.length (6), cells of 10 cm, |x|,|z| <= 14 (2.8 m rug / 2), r 0-7, max 12 items. */
+export const FURN_SAVE_LIMITS = Object.freeze({ kinds: 6, cellM: 0.1, maxCell: 14, rotSteps: 8, maxItems: 12 });
 const VS_ID = /^[A-Za-z0-9_-]{1,24}$/; // a roster-style id (never free text); with a roster only its ids pass
 
 /** The ONE label word stored for a nap spot: the room label when it is in MEMORY_LABELS, else the kind when that word is
@@ -68,6 +80,60 @@ export function visitMemoryShape(m, roster) {
   return Object.keys(clean.cats).length ? clean : null;
 }
 
+function vsInt(n, lo, hi) { return typeof n === 'number' && Number.isInteger(n) && n >= lo && n <= hi; }
+
+/** THE furniture whitelist (rules 2 + 5; read AND write): a fresh { v: 1, items } where every item is exactly
+ *  [k, x, z, r] of integers in range (unknown kind, off-rug cell, odd rotation, extra / missing / text values: that item is
+ *  dropped, never kept), max 12. null when the field is not a v1 furniture record at all (tampered: rejected). Never throws. */
+export function sanitizeFurniture(raw, limits) {
+  const L = limits || FURN_SAVE_LIMITS;
+  try {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw) || raw.v !== 1 || !Array.isArray(raw.items)) return null;
+    const items = [];
+    for (const it of raw.items) {
+      if (items.length >= L.maxItems) break;
+      if (!Array.isArray(it) || it.length !== 4) continue;
+      const [k, x, z, r] = it;
+      if (!vsInt(k, 0, L.kinds - 1) || !vsInt(x, -L.maxCell, L.maxCell) || !vsInt(z, -L.maxCell, L.maxCell) || !vsInt(r, 0, L.rotSteps - 1)) continue;
+      items.push([k, x === 0 ? 0 : x, z === 0 ? 0 : z, r]); // -0 -> 0
+    }
+    return { v: 1, items };
+  } catch (e) { return null; }
+}
+
+/** The furniture field carried over from the record already in storage (whitelisted), or null (gate closed, none, tampered). */
+export function carriedFurniture(storage, key, gate) {
+  if (!(gate === undefined ? FURNITURE_PERSIST : !!gate)) return null;
+  try {
+    if (!storage || typeof storage.getItem !== 'function') return null;
+    const raw = storage.getItem(key || VISIT_STORE_KEY);
+    if (typeof raw !== 'string' || !raw) return null;
+    const rec = JSON.parse(raw);
+    return rec && typeof rec === 'object' ? sanitizeFurniture(rec.furniture) : null;
+  } catch (e) { return null; }
+}
+
+/** The saved furniture { v: 1, items } (whitelisted) or null. gate closed -> null and storage is NOT read. Never throws. */
+export function readFurniture(storage, key, gate) { return carriedFurniture(storage, key, gate); }
+
+/** Save the furniture INTO the visit record (day / visit / kitten memory kept, each re-whitelisted). gate closed -> false and
+ *  storage is NOT touched (rule 1). A tampered / null value saves an empty list (= Remove of every piece).
+ *  roster (optional) re-whitelists the carried kitten memory. Returns true when it went through and read back. */
+export function writeFurniture(storage, furniture, key, gate, roster) {
+  const k = key || VISIT_STORE_KEY;
+  if (!(gate === undefined ? FURNITURE_PERSIST : !!gate)) return false;
+  try {
+    if (!storage || typeof storage.setItem !== 'function') return false;
+    const clean = sanitizeFurniture(furniture) || { v: 1, items: [] };
+    const visit = readVisit(storage, k);
+    let memory = null;
+    if (KITTEN_MEMORY_PERSIST) { try { const old = JSON.parse(storage.getItem(k)); memory = old && typeof old === 'object' ? visitMemoryShape(old.memory, roster) : null; } catch (e) { memory = null; } }
+    storage.setItem(k, JSON.stringify(Object.assign({ v: VISIT_STORE_VERSION }, visit ? { day: visit.day, visit: visit.visit } : {}, memory ? { memory } : {}, { furniture: clean })));
+    const back = carriedFurniture(storage, k, true);
+    return !!back && JSON.stringify(back) === JSON.stringify(clean);
+  } catch (e) { return false; }
+}
+
 /** A localStorage-like adapter in memory (tests, private browsing, a host with no storage). */
 export function memoryStorage(initial) {
   const m = new Map(Object.entries(initial || {}));
@@ -91,7 +157,7 @@ export function readVisit(storage, key) {
 }
 
 /** Save { day, visit }. Returns true when the write went through (false = no storage, quota, private mode, ...). */
-export function writeVisit(storage, saved, key, roster) {
+export function writeVisit(storage, saved, key, roster, furnGate) {
   const k = key || VISIT_STORE_KEY;
   if (!vsValid(saved)) return false;
   try {
@@ -100,7 +166,8 @@ export function writeVisit(storage, saved, key, roster) {
     // { v, cats } re-whitelisted field by field (roster ids when a roster is given); anything else in the record is dropped
     let memory = null;
     if (KITTEN_MEMORY_PERSIST) { try { const old = JSON.parse(storage.getItem(k)); memory = old && typeof old === 'object' ? visitMemoryShape(old.memory, roster) : null; } catch (e) { memory = null; } }
-    storage.setItem(k, JSON.stringify(Object.assign({ v: VISIT_STORE_VERSION, day: Math.floor(saved.day), visit: Math.floor(saved.visit) }, memory ? { memory } : {})));
+    const furniture = carriedFurniture(storage, k, furnGate); //: carried (whitelisted) only while FURNITURE_PERSIST
+    storage.setItem(k, JSON.stringify(Object.assign({ v: VISIT_STORE_VERSION, day: Math.floor(saved.day), visit: Math.floor(saved.visit) }, memory ? { memory } : {}, furniture ? { furniture } : {})));
     // read back: a storage that silently drops writes (some private modes) must not make the end card promise
     const back = readVisit(storage, k);
     return !!back && back.day === Math.floor(saved.day) && back.visit === Math.floor(saved.visit);
