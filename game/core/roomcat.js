@@ -81,6 +81,10 @@ export const ROOMCAT_TUNING = Object.freeze({
   boxDropS: 0.35, boxDropH: 0.6, boxAutoOpenS: 15, waveSize: 5, waveS: 2.5, waveStaggerS: 0.2, boxH: 0.3, boxR: 0.14,
   playEndS: 450, zoomiesS: 20, endS: 600, interest: 1.0, maxCats: 24, // interest 0.75 -> 1.0: with 3 kittens one in four ignored the dot for the whole visit ("they don't chase it")
   // "behave like cats" (GDXE / GE1 2026-10-10; see the header): idle cycle, short walks + pauses, curiosity, home, stalk, doze
+  // Q-GE2 grown cats (owner Quest list 2026-10-11 #4; brief CAT-MOVEMENT-B adult speeds = ROOMCAT_SIZES.adult): an ADULT (size 'adult', opt-in
+  // per cat) is calmer: it joins the laser / wand only after adultJoinS of it being on (kittens: at once), waits adultCdX x pounceCdS
+  // between pounces and skips the wind-down zoomies (it keeps its short walks + pauses). Kitten-only sessions are untouched.
+  adultJoinS: 2.5, adultCdX: 1.5,
   wanderMaxM: 1.2, pauseS0: 0.4, pauseS1: 1.4, idleS0: 1.5, idleS1: 4.5, hopP: 0.12, stretchS: 1.2,
   curiousM: 2.5, curiousAgeS: 3, curiousP: 0.45, curiousStopM: 0.3, lookS0: 1.0, lookS1: 2.5, curiousDetourCdS: 2, hopOverN: 400, smoothLook: 10,
   homeM: 2.3, homeP: 0.6, // homeM 1.6 -> 2.3 (GE1-B 2026-10-11, owner: "play zone is small"): the kittens' home circle doubles in area; still a walk back, in view
@@ -234,7 +238,7 @@ export function createRoomSession(opts = {}) {
   list.forEach((d, i) => {
     const size = ROOMCAT_SIZES[d.size || opts.size || 'kitten'] ? (d.size || opts.size || 'kitten') : 'kitten';
     const c = { id: String(d.id != null ? d.id : 'k' + (i + 1)), size, lim: ROOMCAT_SIZES[size], x: 0, y: 0, z: 0, surf: null, mode: 'inbox', pose: 'inbox',
-      fx: 0, fz: 1, tfx: 0, tfz: 1, v: 0, walked: false, stalkT: 0, stalkOn: false, wigN: 0, wigVx: 0, wigVz: 0, t: 0, plan: [], hop: null, fly: null, poof: false, bond: 0, purr: 0, petCd: 0, interest: prng.chance(T.interest),
+      fx: 0, fz: 1, tfx: 0, tfz: 1, v: 0, walked: false, stalkT: 0, stalkOn: false, wigN: 0, wigVx: 0, wigVz: 0, t: 0, plan: [], hop: null, fly: null, poof: false, bond: 0, purr: 0, petCd: 0, interest: prng.chance(T.interest), warm: 0,
       goal: 'wander', nap: null, eat: 0, hand: null, onT: 0, wave: Math.floor(i / T.waveSize), slot: i % T.waveSize, cool: 0, lastHop: 0,
       tell: 0, tellKind: null, tellX: 0, tellZ: 0, pin: 0, mute: 0, leapCool: 0, leap: null,
       hearts: 0, heartT: 0, treatCd: 0, peeked: false, detourCd: 0, detourTo: null, dotX0: 0, dotZ0: 0, hardT: [], sulk: 0, tossHard: false, nmTick: -1e9,
@@ -353,6 +357,7 @@ export function createRoomSession(opts = {}) {
   const rcFastDot = (L) => { rcDotVel(L, dotV); return rcLen(dotV.x, dotV.z) > T.creepDotV; };
   /** the chase speed at distance d from dot L: inside the band creepV (slow dot) or stalkV (moving dot); outside it the run slows
    *  (accelDown) so it ENTERS the band at that speed */
+  const rcKeen = (c) => c.size !== 'adult' || c.warm >= RC_T(T.adultJoinS); // Q-GE2: a grown cat watches the toy a moment before it joins
   const rcChaseV = (c, d, L) => { const vb = rcFastDot(L) ? T.stalkV : T.creepV; return d <= T.stalkM ? vb : Math.min(c.lim.run, Math.sqrt(vb * vb + 2 * T.accelDown * (d - T.stalkM))); };
   // same-surface detour (P0a fix round): a path over the surface's sample grid (neighbours = samples within 2.5 grid steps
   // joined by a legal straight line; built once per surface, cached), BFS from the sample nearest the cat to the sample nearest
@@ -555,7 +560,7 @@ export function createRoomSession(opts = {}) {
       if (!planTo(c, c.nap.surf, c.nap.x, c.nap.z)) { s.napTaken = s.napTaken.filter((q) => q !== c.nap); c.nap = { surf: c.surf, x: c.x, y: c.y, z: c.z }; s.napTaken.push(c.nap); }
       return;
     }
-    const zoom = s.phase === 'wind';
+    const zoom = s.phase === 'wind' && c.size !== 'adult'; // Q-GE2: grown cats skip the zoomies
     if (c.sulk > 0) { // wandering off: a far sample of its surface, walked, then a loaf; no play until the sulk ends
       const surf = roomSurface(room, c.surf); let far = null, fd = -1;
       for (let i = 0; i < 6; i++) { const p = prng.pick(surf.samples); const d = rcLen(p.x - c.x, p.z - c.z); if (d > fd && rcClear(p.x, p.z) && rcSegClear(c.x, c.z, p.x, p.z) && roomLineLegal(room, c.surf, c, p)) { fd = d; far = p; } }
@@ -573,7 +578,7 @@ export function createRoomSession(opts = {}) {
       if (planTo(c, at.surf, at.x, at.z)) return;
     }
     // laser chase (a muted cat, pin just ended, sits and watches the dot until the player moves it)
-    if (s.laser && c.interest && s.phase === 'play') {
+    if (s.laser && c.interest && s.phase === 'play' && rcKeen(c)) {
       const L = s.laser;
       if (c.mute > 0) { c.mode = 'idle'; c.pose = 'sit'; c.t = RC_T(0.2); rcFace(c, L.x - c.x, L.z - c.z); return; }
       if (c.surf === L.surf) {
@@ -600,7 +605,7 @@ export function createRoomSession(opts = {}) {
       c.mode = 'idle'; c.pose = 'stare'; c.t = RC_T(0.4); rcFace(c, L.x - c.x, L.z - c.z); return;
     }
     // wand
-    if (s.wand && s.wand.at && c.interest && s.phase === 'play') {
+    if (s.wand && s.wand.at && c.interest && s.phase === 'play' && rcKeen(c)) {
       const W = s.wand.at;
       // big leap: a fast tip + a reachable HIGHER legal surface within leapReach of the tip -> tell (crouch) then hop
       if (s.wand.speed > T.bigLeapV && c.leapCool <= 0 && c.cool <= 0 && c.surf && rcLen(W.x - c.x, W.z - c.z) <= T.batR + T.leapRun) {
@@ -727,7 +732,7 @@ export function createRoomSession(opts = {}) {
     if (!held && prng.chance(T.staleP)) { x = c.tellX; z = c.tellZ; d = rcLen(x - c.x, z - c.z); }
     if (d > T.pounceReach) { const k = T.pounceReach / d; x = c.x + (x - c.x) * k; z = c.z + (z - c.z) * k; }
     if (!legalAt(c, x, z)) { x = L.x; z = L.z; d = rcLen(x - c.x, z - c.z); if (d > T.pounceReach) { const k = T.pounceReach / d; x = c.x + (x - c.x) * k; z = c.z + (z - c.z) * k; } if (!legalAt(c, x, z)) { x = c.x; z = c.z; } }
-    c.dotX0 = L.x; c.dotZ0 = L.z; startHop(c, c.surf, x, c.y, z, 0.12, 'pounce'); c.cool = RC_T(T.pounceCdS);
+    c.dotX0 = L.x; c.dotZ0 = L.z; startHop(c, c.surf, x, c.y, z, 0.12, 'pounce'); c.cool = RC_T(c.size === 'adult' ? T.pounceCdS * T.adultCdX : T.pounceCdS);
   };
   const rcLeapGo = (c) => {
     const l = c.leap; c.leap = null;
@@ -737,7 +742,7 @@ export function createRoomSession(opts = {}) {
   // nothing stays on a hand without an active pinch / treat: tracking silent for handLostS -> let go
   const handLost = (c) => { const hs = s.hands[c.hand]; return s.tick - Math.max(hs ? hs.tick : -1e9, c.onT) > RC_T(T.handLostS); };
   const stepCat = (c) => {
-    if (c.cool > 0) c.cool--; if (c.petCd > 0) c.petCd--; if (c.purr > 0) c.purr--; if (c.mute > 0) c.mute--; if (c.leapCool > 0) c.leapCool--;
+    if (c.cool > 0) c.cool--; if (c.petCd > 0) c.petCd--; if (c.purr > 0) c.purr--; if (c.mute > 0) c.mute--; if (c.leapCool > 0) c.leapCool--; if (c.size === 'adult') c.warm = s.laser || s.wand ? c.warm + 1 : 0;
     if (c.treatCd > 0) c.treatCd--; if (c.detourCd > 0) c.detourCd--; if (c.curDetCd > 0) c.curDetCd--; if (c.sulk > 0) c.sulk--; if (c.hearts > 0 && --c.heartT <= 0) { c.hearts--; c.heartT = RC_T(T.heartsDecayS); }
     if (c.mode === 'inbox') {
       c.y = s.box.y;

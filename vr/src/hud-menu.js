@@ -36,7 +36,10 @@
      visual = { open, hidden, active, pose: { c, r, u, n }, button: { p, hover, w, h }, tiles: [{ id, label, p, hover,
        active, disabled }], cursors: { left: p | null, right: p | null } }
    Build rule: only `export function` / `export const`; private names carry the `hm` / `HM_` prefix. */
-export const HUD_MENU_VERSION = 3; // 3 (Q-GE2, owner #7 + GO7 SHOULD 1): a Furniture tile opens a furniture picker page (same 7 tiles); the
+export const HUD_MENU_VERSION = 4; // 4 (Q-GE2 SK-PORT wiring, owner yes 2026-10-11 05:06 UTC): Feather Pop + Yarn Tug command tiles (9 tiles = 3 x 3,
+                                    // the same 3 rows as v3, so the panel height is unchanged), per-action blocked captions (HUD_BLOCKED), a
+                                    // Kitten Needs hint outline on one tile (hudSetHint), a Back tile on the Furniture page, empty tiles inert.
+                                    // 3 3 (Q-GE2, owner #7 + GO7 SHOULD 1): a Furniture tile opens a furniture picker page (same 7 tiles); the
                                     // Laser tool's trigger always lights the laser (no pet-lock), the trigger pets only with the Pet tool.
                                     // 2 (GE2-B, the owner's Quest test 2026-10-11 petting): controller pet reach is a column over the kitten
                                     // (petAboveM), a Laser trigger aimed AT a kitten pets her (lockR), pets pass the menu suppression unless that
@@ -71,15 +74,23 @@ export const HUD_ACTIONS = Object.freeze([
   Object.freeze({ id: 'toss', label: 'Grab + Toss', tip: 'Aim + hold to grab, let go to toss' }),
   Object.freeze({ id: 'call', label: 'Call cats', tip: 'Hold trigger / pinch: kittens come' }),
   Object.freeze({ id: 'laser_tag', label: 'Laser Tag', tip: 'Start a round', command: true }),
+  Object.freeze({ id: 'feather', label: 'Feather Pop', tip: 'Snatch it before a kitten pounces', command: true }), // SK-PORT (QUEST-PORT-WIRING 1)
+  Object.freeze({ id: 'tug', label: 'Yarn Tug', tip: 'Hold to pull, tap in rhythm', command: true }),             // SK-PORT
   Object.freeze({ id: 'furniture', label: 'Furniture', tip: 'Place, move, turn or remove furniture', command: true }), // Q-GE2 (owner #7): opens the picker page
 ]);
 export const HUD_ACTION_IDS = Object.freeze(HUD_ACTIONS.map((a) => a.id));
 /** Q-GE2: the Furniture picker page (wand.js FURN_VR_PICKER: 6 pieces + Remove = as many tiles as the main page). Picking one
  *  emits command 'furn:<kind>' (or 'furn:remove') and closes the menu; closing the menu always returns to the main page. */
 export const HUD_FURN_TILES = Object.freeze(FURN_VR_PICKER.map((t) => Object.freeze({ id: 'furn:' + t.id, label: t.label, command: true,
-  tip: t.id === 'remove' ? 'Remove the piece you touched last (or drop it on the bin)' : 'Grip / pinch it to move, twist or stick to turn' })));
+  tip: t.id === 'remove' ? 'Remove the piece you touched last (or drop it on the bin)' : 'Grip / pinch it to move, twist or stick to turn' })).concat(
+  [Object.freeze({ id: 'furn:back', label: 'Back', tip: 'Back to the actions', command: true })])); // SK-PORT: 9 main tiles, so the picker gets a Back tile
 export const HUD_DEFAULT_ACTION = 'laser';
 export const HUD_CAPTIONS = Object.freeze({ menu_open: '(actions)', tool: '', blocked: 'Laser Tag: fill the Happiness meter first', command: '' });
+/** SK-PORT (Review PORT1 SHOULD 3): the caption for a greyed tile, by the REASON the glue greyed it (room-bridge b._hudWhy[action]) */
+export const HUD_BLOCKED = Object.freeze({
+  laser_tag: 'Laser Tag: fill the Happiness meter first', feather: 'Feather Pop: wait for the kittens to come out', tug: 'Yarn Tug: wait for the kittens to come out',
+  lt: 'Finish Laser Tag first', feather_on: 'Finish the feather round first', tug_on: 'Finish the Yarn Tug first', no_kitten: 'Yarn Tug: no kitten close by. Look at one and try again',
+});
 export const HAND_IDS = Object.freeze(['left', 'right']);
 const HM_BTN = 100, HM_NONE = -1;
 import { FURN_VR_PICKER } from './wand.js';
@@ -105,10 +116,10 @@ export function hudLayout(tuning) {
 export function createHudMenu(opts = {}) {
   const T = Object.assign({}, HUD_TUNING, opts.tuning || {});
   const L = hudLayout(T);
-  const tiles = HUD_ACTIONS.map((a, i) => ({ id: a.id, label: a.label, tip: a.tip, command: !!a.command, p: hmV(), hover: false, pressed: false, active: a.id === HUD_DEFAULT_ACTION, disabled: false, u: L.tiles[i].u, v: L.tiles[i].v }));
+  const tiles = HUD_ACTIONS.map((a, i) => ({ id: a.id, label: a.label, tip: a.tip, command: !!a.command, p: hmV(), hover: false, pressed: false, hint: false, active: a.id === HUD_DEFAULT_ACTION, disabled: false, u: L.tiles[i].u, v: L.tiles[i].v }));
   const pose = { c: hmV(), r: hmSet(hmV(), 1, 0, 0), u: hmSet(hmV(), 0, 1, 0), n: hmSet(hmV(), 0, 0, 1) };
   const visual = { page: 'main', open: false, hidden: false, active: HUD_DEFAULT_ACTION, pose, beams: { left: { show: false, o: hmV(), e: hmV() }, right: { show: false, o: hmV(), e: hmV() } }, hoverTip: '', button: { p: hmV(), hover: false, w: T.btnW, h: T.btnH }, tiles, cursors: { left: null, right: null }, placed: false };
-  const st = { page: 'main', T, L, open: false, active: opts.active && HUD_ACTION_IDS.includes(opts.active) ? opts.active : HUD_DEFAULT_ACTION, placed: false, following: false, opens: 0, selects: 0,
+  const st = { page: 'main', hint: '', T, L, open: false, active: opts.active && HUD_ACTION_IDS.includes(opts.active) ? opts.active : HUD_DEFAULT_ACTION, placed: false, following: false, opens: 0, selects: 0,
     src: { left: hmSrcState(), right: hmSrcState() }, events: [], haptics: [], _evPool: hmEvPool(16), _hPool: [{ hand: '', strength: 0, ms: 0 }, { hand: '', strength: 0, ms: 0 }, { hand: '', strength: 0, ms: 0 }, { hand: '', strength: 0, ms: 0 }],
     _nEv: 0, _nH: 0, _toggled: false, closeAt: -1, picked: -1, _t: 0, _k: 0.5, _probe: { lu: 0, lv: 0 }, suppress: { left: { all: false, pinch: false }, right: { all: false, pinch: false } }, visual, _out: null,
     gest: { left: hmGestPool(), right: hmGestPool() }, live: { left: false, right: false }, toolOut: [], filtOut: [] };
@@ -162,7 +173,7 @@ export function hudRegion(st, lu, lv) { const s = st._probe; s.lu = lu; s.lv = l
 function hmRegion(st, s) {
   const T = st.T, L = st.L, b = L.btn, lu = s.lu, lv = s.lv;
   if (Math.abs(lu - b.u) <= T.btnW / 2 && Math.abs(lv - b.v) <= T.btnH / 2) return HM_BTN;
-  if (st.open) for (let i = 0; i < st.visual.tiles.length; i++) { const t = st.visual.tiles[i]; if (Math.abs(lu - t.u) <= T.tileW / 2 && Math.abs(lv - t.v) <= T.tileH / 2) return i; }
+  if (st.open) for (let i = 0; i < st.visual.tiles.length; i++) { const t = st.visual.tiles[i]; if (!t.id) continue; if (Math.abs(lu - t.u) <= T.tileW / 2 && Math.abs(lv - t.v) <= T.tileH / 2) return i; }
   const m = T.margin, halfW = Math.max(T.stripW, L.gridW) / 2 + m;
   if (Math.abs(lu) <= halfW && lv >= -T.stripH / 2 - m && lv <= (st.open ? T.stripH / 2 + T.gap + L.gridH : T.stripH / 2) + m) return -2;
   return HM_NONE;
@@ -214,17 +225,18 @@ function hmSetOpen(st, open, head) {
 /** Q-GE2: show the Furniture picker page (on) or the main actions (off) on the same tile objects */
 function hmFurnPage(st, on) {
   const list = on ? HUD_FURN_TILES : HUD_ACTIONS, tiles = st.visual.tiles;
-  for (let i = 0; i < tiles.length; i++) { const a = list[i] || null, t = tiles[i]; t.id = a ? a.id : ''; t.label = a ? a.label : ''; t.tip = a ? a.tip : ''; t.command = !!(a && a.command); t.active = !on && t.id === st.active; t.hover = false; }
+  for (let i = 0; i < tiles.length; i++) { const a = list[i] || null, t = tiles[i]; t.id = a ? a.id : ''; t.label = a ? a.label : ''; t.tip = a ? a.tip : ''; t.command = !!(a && a.command); t.active = !on && t.id === st.active; t.hover = false; t.hint = !on && st.hint !== '' && t.id === st.hint; }
   st.page = on ? 'furniture' : 'main'; st.visual.page = st.page;
 }
 function hmPick(st, hand, s, idx, input) {
   if (idx === HM_BTN) { hmToggle(st, input.head); hmHaptic(st, hand, st.T.clickHaptic, st.T.clickMs); return; }
-  const tile = st.visual.tiles[idx]; if (!tile || st.closeAt >= 0) return;
+  const tile = st.visual.tiles[idx]; if (!tile || !tile.id || st.closeAt >= 0) return; // SK-PORT: an empty picker slot is inert
   if (tile.disabled) { hmHaptic(st, hand, 0.2, 12); hmHaptic(st, hand, 0.2, 12); hmEmit(st, 'blocked', hand, '', tile.id); return; } // a weaker double tick: not a success
   hmHaptic(st, hand, st.T.clickHaptic, st.T.clickMs);
   st.selects++;
   hmEmit(st, 'select', hand, '', tile.id);
   if (tile.id === 'furniture') { hmFurnPage(st, true); return; } // the picker opens in place: the menu stays open
+  if (tile.id === 'furn:back') { hmFurnPage(st, false); return; } // SK-PORT: back to the actions, the menu stays open
   if (tile.command) hmEmit(st, 'command', hand, '', tile.id);
   else if (tile.id !== st.active) { st.active = tile.id; for (const t of st.visual.tiles) t.active = t.id === st.active; st.visual.active = st.active; hmEmit(st, 'tool', hand, '', tile.id); }
   if (st.T.closeOnSelect) { st.closeAt = st._t + st.T.closeS; st.picked = idx; }
@@ -460,14 +472,25 @@ export function laserGateFilter(gate, roomEvents) {
   return roomEvents;
 }
 
-/** Quick stats for the strip (short + large): director view + state. Returns plain strings; the host redraws on change. */
-export function hudStats(dir, state, active) {
+/** SK-PORT (QUEST-PORT-WIRING 18): outline the tile `id` (a Kitten Needs hint: 'treat' | 'laser' | 'pet'; '' / null = none). No allocation. */
+export function hudSetHint(st, id) {
+  const h = id && HUD_ACTION_IDS.includes(id) ? id : '';
+  if (st.hint === h) return false;
+  st.hint = h; for (let i = 0; i < st.visual.tiles.length; i++) { const t = st.visual.tiles[i]; t.hint = st.page === 'main' && h !== '' && t.id === h; }
+  return true;
+}
+
+/** Quick stats for the strip (short + large): director view + state. Returns plain strings; the host redraws on change.
+ *  port (optional, SK-PORT) = { line2: string | null (a Feather Pop / Yarn Tug / Kitten Needs line replaces line 2 outside Laser Tag),
+ *  needs: { id, name, hunger, play, cuddle, sleepy } (10 % steps) | null, needsKey: string } */
+export function hudStats(dir, state, active, port) {
   const mode = dir ? dir.mode : 'play';
   const label = { play: 'Play', celebrate: 'Yay!', offer: 'Tag ready', countdown: 'Laser Tag', playing: 'Laser Tag', scorecard: 'Score' }[mode] || 'Play';
   let cats = 0; if (state && state.cats) for (const c of state.cats) if (c.mode !== 'inbox') cats++;
   const act = HUD_ACTIONS.find((a) => a.id === active);
   const happy = dir && Number.isFinite(dir.meter) ? Math.round(Math.max(0, Math.min(1, dir.meter)) * 20) * 5 : 0; // 5 % steps: the strip redraws rarely
   const line1 = `${act ? act.label : ''} | ${label}`;
-  const line2 = mode === 'playing' && dir.hud ? String(dir.hud) : `Happy ${happy}%  Cats ${cats}`;
-  return { line1, line2, key: line1 + '|' + line2, happy, cats, mode: label, action: act ? act.label : '' };
+  const line2 = mode === 'playing' && dir.hud ? String(dir.hud) : port && port.line2 ? port.line2 : `Happy ${happy}%  Cats ${cats}`;
+  const needs = port && port.needs && port.needsKey ? port.needs : null;
+  return { line1, line2, key: line1 + '|' + line2 + (needs ? '|' + port.needsKey : ''), happy, cats, mode: label, action: act ? act.label : '', needs };
 }

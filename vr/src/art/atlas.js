@@ -16,17 +16,47 @@ export const ANIMS = Object.freeze(['idle', 'walk', 'sit', 'pounce', 'purr', 'sl
 export const VIEW_ALIAS = Object.freeze({ side: 'side', right: 'side', left: 'side', front: 'front', back: 'back', top: 'top', above: 'top', below: 'top' });
 /** roomcat poses (cat-sprites POSE_MAP keys) -> atlas anim. `hold0` = show only the first frame (the crouch). */
 export const ANIM_ALIAS = Object.freeze({
-  idle: 'idle', stand: 'idle', stare: 'idle', land: 'idle',
-  walk: 'walk', run: 'walk', trot: 'walk', climb: 'walk', fall: 'walk', twist: 'walk',
+  idle: 'idle', stand: 'idle', stare: 'idle', land: 'land',
+  walk: 'walk', run: 'run', trot: 'walk', climb: 'walk', fall: 'walk', twist: 'walk',
   sit: 'sit', beg: 'sit', pin: 'sit',
   carried: 'carried', held: 'carried', eat: 'eat', nom: 'eat', poof: 'poof', startle: 'poof', bat: 'bat', swipe: 'bat',
-  pounce: 'pounce', hop: 'pounce', crouch: 'pounce:hold0', tell: 'pounce:hold0',
+  pounce: 'pounce', hop: 'pounce', crouch: 'crouch', tell: 'crouch',
   purr: 'purr', petted: 'purr', loaf: 'purr',
   sleep: 'sleep', nap: 'sleep',
   // roomcat v5 idle cycle (owner's Quest test 2026-10-10 fixes): no groom / stretch art yet -> nearest existing frames
   // Q-GE2 (brief B 4/7): stretch is the idle frame + cat-billboard's procedural play-bow, never the crouch (pounce frame 0)
-  groom: 'sit', stretch: 'idle', pause: 'idle',
+  groom: 'sit', stretch: 'bow', pause: 'idle',
+  // Q-GE2 move art (CAT-MOVEMENT-B C, Design 2026-10-12): the 8 move anims by name; moveAnimFor() picks them from roomcat state.
+  // A manifest without move frames falls back through MOVE_FALLBACK (the v3.2 frames), so old art never breaks.
+  stalk: 'stalk', wiggle: 'wiggle', launch: 'launch', miss: 'miss', bow: 'bow',
 });
+/** Q-GE2: the move anims (manifest m.move fps / loop) and what each falls back to when a manifest has no frames for it */
+export const MOVE_ANIMS = Object.freeze(['stalk', 'crouch', 'wiggle', 'launch', 'land', 'miss', 'run', 'bow']);
+export const MOVE_FALLBACK = Object.freeze({ stalk: 'walk', crouch: 'pounce:hold0', wiggle: 'pounce:hold0', launch: 'pounce', land: 'idle', miss: 'idle', run: 'walk', bow: 'idle' });
+/** loops that follow the cat's speed (clamped 0.6-2.5x like the walk): the speed at which the base fps does not slide */
+export const MOVE_REF_MPS = Object.freeze({ stalk: 0.4, run: 0.8 });
+/** Q-GE2 sequence rule (brief C transitions): per-kitten scratch, allocated once; stage 0 none, 1 stalk, 2 crouch, 3 wiggle,
+ *  4 launch, 5 land, 6 miss. hold = the stalk FREEZE (the host stops the cycle clock: the current stalk frame is held). */
+export function createMoveSeq() { return { stage: 0, hold: false }; }
+/** Which anim a kitten shows. c = a room-bridge billboard cat (mode, pose, tell, stalk, airborne), pose = artPose(c.pose).
+ *  Returns a string literal (no allocation). wiggle and launch play ONLY after stalk -> crouch (a tell straight out of a run, a
+ *  leap tell or a re-tell after a miss shows the crouch held instead of the wiggle, and the v3.2 pounce leap instead of launch). */
+export function moveAnimFor(q, c, pose) {
+  q.hold = false;
+  const st = q.stage, mode = c.mode, tell = c.tell;
+  if (tell) {
+    if (tell.phase === 'wiggle' && (st === 2 || st === 3)) { q.stage = 3; return 'wiggle'; }
+    q.stage = st === 1 || st === 2 ? 2 : st === 3 ? 3 : 0;
+    return 'crouch';
+  }
+  if (mode === 'stalk') { q.stage = 1; q.hold = c.stalk === 'freeze'; return 'stalk'; }
+  if (mode === 'hop') { if (st === 3 || st === 4) { q.stage = 4; return 'launch'; } q.stage = 0; return pose; }
+  if (pose === 'land') { q.stage = st === 4 || st === 5 ? 5 : 0; return 'land'; }
+  if (pose === 'stare' && (st === 5 || st === 6)) { q.stage = 6; return 'miss'; } // the pounce missed: miss-look, then idle
+  if (pose === 'stare' && (st === 1 || st === 2)) return pose; // GE1-B hesitation stare inside the approach keeps the stalk
+  q.stage = 0;
+  return pose;
+}
 const RUN_FPS_X = 1.8; // run / trot / fall play the walk cycle faster when no speed is given
 /** Q-GE2 (brief B A1, scurry fix): the walk cycle's rate follows the cat's real speed, clamped to 0.6-2.5x the base fps,
  *  so a 0.35 m/s kitten no longer plays ~39 fps and a 0.9 m/s run never aliases past 2.5x */
@@ -59,17 +89,47 @@ export function createAtlas(manifest, opt) {
   const M = manifest, o = opt || {};
   if (!M || !M.cats) throw new Error('atlas: bad manifest');
   const ids = Object.keys(M.cats);
-  /** exact id, else the main.js placeholder ids k1..k8 map onto the starter order */
+  // Q-GE2: move anim specs from m.move { fps, loop } (merge-move-manifest.py leaves m.anims[move] = {}), built once
+  const SPEC = {}, MV = M.move || null;
+  for (const a of Object.keys(M.anims || {})) SPEC[a] = M.anims[a];
+  if (MV && MV.fps) for (const a of MOVE_ANIMS) if (MV.fps[a] > 0) {
+    const f = MV.fps[a]; SPEC[a] = { fps: { side: f, front: f, back: f, top: f }, loop: !!(MV.loop && MV.loop[a]), noSlideMps: MOVE_REF_MPS[a] || 0 };
+  }
+  const SPEED_ANIMS = { walk: true, run: true, stalk: true };
+  // Q-GE2 adult art (Design 2026-10-12): grown forms live in M.adults (NOT M.cats: ids / cats() / k1..k8 stay the 8 kittens).
+  // catEntry() is the one lookup for frames / sheets / atlas; an adult's animOverride (walk / run fps + noSlideMps, moveFps)
+  // replaces those specs for that cat only, every other anim keeps manifest.anims.
+  const AD = M.adults || null;
+  const catEntry = (id) => M.cats[id] || (AD && AD[id]) || null;
+  const CSPEC = {}; // adult id -> spec table (built once)
+  if (AD) for (const [id, c] of Object.entries(AD)) {
+    const ao = c.animOverride; if (!ao) continue;
+    const t = Object.assign({}, SPEC);
+    for (const a of ['walk', 'run']) if (ao[a] && ao[a].fps) t[a] = { fps: ao[a].fps, loop: ao[a].loop !== false, noSlideMps: ao[a].noSlideMps || 0 };
+    if (ao.moveFps) for (const a of MOVE_ANIMS) if (ao.moveFps[a] > 0 && a !== 'run') {
+      const f = ao.moveFps[a]; t[a] = { fps: { side: f, front: f, back: f, top: f }, loop: !!(MV && MV.loop && MV.loop[a]), noSlideMps: MOVE_REF_MPS[a] || 0 };
+    }
+    CSPEC[id] = t;
+  }
+  const specOf = (cat) => CSPEC[cat] || SPEC;
+  /** alias -> [base anim, hold0] per (cat, view): a move anim the sheet lacks takes its MOVE_FALLBACK (no allocation per call) */
+  function resolveAnim(cat, v, anim) {
+    let a = ANIM_ALIAS[anim] || 'idle';
+    const fr = catEntry(cat).frames[v], S = specOf(cat);
+    if (MOVE_FALLBACK[a] && !(S[a] && S[a].fps && fr[a] && fr[a].length)) a = MOVE_FALLBACK[a];
+    return a;
+  }
+  /** exact id (kitten or Q-GE2 adult id), else the main.js placeholder ids k1..k8 map onto the starter order (kittens only) */
   function resolveCat(id) {
-    if (M.cats[id]) return id;
+    if (M.cats[id] || (AD && AD[id])) return id;
     const m = /^k(\d+)$/.exec(String(id));
     if (m) { const k = (Number(m[1]) - 1) % ids.length; return ids[k < 0 ? 0 : k]; }
     return null;
   }
-  /** sheet size + ppm for a LOD (every sheet of a kitten has the same size); file = the sheet's file (default: the first sheet) */
+  /** sheet size + ppm for a LOD (every sheet of one cat has the same size: kitten 512 x 512, adult 1024 x 512); file = the sheet's file (default: the first sheet) */
   function lodInfo(cat, lod, sheet) {
-    const L = M.cats[cat].atlas, want = lod === 'lo' ? 'lo' : 'hi', a = L[want];
-    const sh = sheet || null, S = M.cats[cat].sheets;
+    const E = catEntry(cat), L = E.atlas, want = lod === 'lo' ? 'lo' : 'hi', a = L[want];
+    const sh = sheet || null, S = E.sheets;
     const file = sh ? (S && S[sh] && S[sh][want]) || `cats/${cat}/${sh}.${want}.png` : a.file;
     return { lod: want, file, w: a.w, h: a.h, ppm: a.ppm, half: a.half || null, sheet: sh };
   }
@@ -77,7 +137,7 @@ export function createAtlas(manifest, opt) {
   function sheetFiles(cat, lod) {
     const r = resolveCat(cat); if (!r) return [];
     const want = lod === 'lo' ? 'lo' : 'hi', out = new Set();
-    for (const v of Object.values(M.cats[r].frames)) for (const list of Object.values(v)) for (const f of list) out.add(lodInfo(r, want, f.hi.s).file);
+    for (const v of Object.values(catEntry(r).frames)) for (const list of Object.values(v)) for (const f of list) out.add(lodInfo(r, want, f.hi.s).file);
     return [...out];
   }
   /**
@@ -90,11 +150,11 @@ export function createAtlas(manifest, opt) {
     fo = fo || {};
     const cat = resolveCat(catId); if (!cat) return null;
     const v = VIEW_ALIAS[view] || 'side', fellView = !VIEW_ALIAS[view] || (view === 'below');
-    let a = ANIM_ALIAS[anim] || 'idle'; const hold0 = a.endsWith(':hold0'); a = a.replace(':hold0', '');
-    const list = M.cats[cat].frames[v][a], n = list.length, spec = M.anims[a];
+    let a = resolveAnim(cat, v, anim); const hold0 = a.endsWith(':hold0'); if (hold0) a = a.slice(0, -6);
+    const SP = specOf(cat), list = catEntry(cat).frames[v][a], n = list.length, spec = SP[a];
     let fps = spec.fps[v] || 1;
-    const cyc = a === 'walk' && Number.isFinite(fo.cycleT); // walk only: other anims keep t
-    if (a === 'walk' && !cyc) fps *= fpsScaleOf(anim, a, spec, fo.speedMps);
+    const cyc = SPEED_ANIMS[a] === true && Number.isFinite(fo.cycleT); // walk / run / stalk: the host's speed clock; other anims keep t
+    if (SPEED_ANIMS[a] === true && !cyc) fps *= fpsScaleOf(anim, a, spec, fo.speedMps);
     const tt = Math.max(0, cyc ? fo.cycleT : (Number(t) || 0));
     let idx, done = false;
     if (hold0) idx = 0;
@@ -110,19 +170,21 @@ export function createAtlas(manifest, opt) {
       cat, view: v, anim: a, index: idx, count: n, done, lod: L.lod, file: L.file, sheet: L.sheet, atlasW: L.w, atlasH: L.h,
       rect: [x, y, w, h], uv: { u0, v0, u1, v1 }, flipX,
       sizeM: [w / L.ppm, h / L.ppm], centerM: [flipX ? -cx : cx, cy], liftM: fr.liftM || 0,
-      fell: { view: fellView, anim: !M.anims[anim] },
+      fell: { view: fellView, anim: !SPEC[anim] || !SPEC[anim].fps },
     };
   }
   /** walk-rate multiplier for a roomcat pose at a speed (1 for non-walk anims): run / trot / fall without a speed = RUN_FPS_X */
   function fpsScaleOf(anim, a, spec, speedMps) {
-    if (a !== 'walk') return 1;
+    if (SPEED_ANIMS[a] !== true) return 1;
     if (speedMps > 0 && spec.noSlideMps) return walkFpsScale(speedMps, spec.noSlideMps);
-    return anim === 'run' || anim === 'trot' || anim === 'fall' ? RUN_FPS_X : 1;
+    return a === 'walk' && (anim === 'run' || anim === 'trot' || anim === 'fall') ? RUN_FPS_X : 1;
   }
   /** Q-GE2: the host integrates cycleT += dt * fpsScale(pose, speed) per kitten (no allocation) */
-  function fpsScale(anim, speedMps) {
-    let a = ANIM_ALIAS[anim] || 'idle'; a = a.replace(':hold0', '');
-    return fpsScaleOf(anim, a, M.anims[a] || {}, speedMps);
+  function fpsScale(anim, speedMps, catId, view) {
+    const cat = catId != null ? resolveCat(catId) : ids[0];
+    let a = cat ? resolveAnim(cat, VIEW_ALIAS[view] || 'side', anim) : (ANIM_ALIAS[anim] || 'idle');
+    if (a.endsWith(':hold0')) return 1;
+    return fpsScaleOf(anim, a, (cat ? specOf(cat) : SPEC)[a] || {}, speedMps);
   }
   /** GE2 adapter for createSpriteCache({ draw }): draw frame f (from getFrame) out of its loaded atlas image into a px x px
    *  canvas that spans spanM metres (default 0.5), the floor point / body centre at (px / 2, 0.85 px). Same scale every frame. */
@@ -136,6 +198,12 @@ export function createAtlas(manifest, opt) {
   }
   /** files to load for a set of cats at a lod (dedup) */
   function files(cats, lod) { const out = new Set(); for (const c of cats || ids) for (const f of sheetFiles(c, lod)) out.add(f); return [...out]; }
+  /** Q-GE2: GPU bytes (RGBA8, no mipmaps) of one sheet file from its cat's atlas size (kitten hi 1 MB, adult hi 2 MB); null = unknown file */
+  const FILE_BYTES = new Map();
+  for (const id of [...ids, ...(AD ? Object.keys(AD) : [])]) for (const lod of ['hi', 'lo']) { const a = catEntry(id).atlas[lod]; for (const f of sheetFiles(id, lod)) FILE_BYTES.set(f, a.w * a.h * 4); }
+  function sheetGpuBytes(file) { return FILE_BYTES.has(file) ? FILE_BYTES.get(file) : null; }
+  /** Q-GE2: the adult art id for a kitten id (M.cats[id].adultId when that adult is bundled), else null */
+  function adultIdOf(id) { const r = M.cats[id] ? id : null, a = r && M.cats[r].adultId; return a && AD && AD[a] ? a : null; }
   /** GPU bytes for { hi: n, lo: m } resident kitten SHEETS (one per kitten at a time) + the box (RGBA8, no mipmaps) */
   function gpuBytes(counts, o) {
     let b = M.box && !(o && o.box === false) ? M.box.atlas.w * M.box.atlas.h * 4 : 0;
@@ -148,5 +216,7 @@ export function createAtlas(manifest, opt) {
     const [x, y, w, h] = f.r;
     return { file: B.atlas.file, rect: f.r, uv: { u0: x / B.atlas.w, v0: 1 - (y + h) / B.atlas.h, u1: (x + w) / B.atlas.w, v1: 1 - y / B.atlas.h } };
   }
-  return { version: ATLAS_VERSION, manifest: M, cats: () => ids.slice(), resolveCat, getFrame, fpsScale, drawFrame, files, sheetFiles, gpuBytes, boxFace, lodInfo };
+  /** Q-GE2: true when this atlas has frames for every move anim (the art from CAT-MOVEMENT-B C is bundled) */
+  const hasMove = !!MV && ids.every((id) => MOVE_ANIMS.every((a) => VIEWS.every((v) => M.cats[id].frames[v] && M.cats[id].frames[v][a] && M.cats[id].frames[v][a].length)));
+  return { version: ATLAS_VERSION, manifest: M, hasMove, cats: () => ids.slice(), resolveCat, getFrame, fpsScale, drawFrame, files, sheetFiles, gpuBytes, boxFace, lodInfo, catEntry, adultIdOf, adults: () => (AD ? Object.keys(AD) : []), sheetGpuBytes };
 }

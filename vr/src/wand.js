@@ -516,7 +516,7 @@ export function furnitureStep(st, ev, ctx) {
     if (H.mode === 'ray' && ev.ray && ev.ray.o && ev.ray.d) { if (wdRayFloor(ev.ray, p.y)) { p.x = WD_D.x + H.ox; p.z = WD_D.z + H.oz; } }
     else if (ev.p && Number.isFinite(ev.p.x)) { p.x = ev.p.x + H.ox; p.z = ev.p.z + H.oz; }
     if (H.hy0 != null && Number.isFinite(ev.yaw)) p.yaw = H.yaw0 + (ev.yaw - H.hy0);
-    p.saved = null; // the player moved it: its new rug cell is saved from now on (rule 4)
+    p.saved = null; p.noSave = false; // the player moved it: its new rug cell is saved from now on (rule 4; GO9b SHOULD 1: also a piece carried in from a scanned room)
     wdClampPiece(st, p); out.consumed = true; out.event = 'move'; out.id = p.id; return out;
   }
   if (ty === 'rotate') return wdRotate(st, p, ev, out);
@@ -566,11 +566,13 @@ export function furnitureSave(st, frame) {
   const items = [];
   for (const p of st.pieces) {
     if (items.length >= WD_MAXSAVE) break;
-    const c = p.saved ? p.saved.slice() : furnitureCell(p, frame);
+    const c = p.saved ? p.saved.slice() : p.noSave ? null : furnitureCell(p, frame); // noSave: carried in from a scanned room, x / z last clamped to a REAL floor (GO9b SHOULD 1): not saved until moved on the rug
     if (c) items.push(c);
   }
   return { v: 1, items };
 }
+/** GO9b SHOULD 1: a piece carried into a new session (room-bridge start) is clamped into THIS session's furniture floor (the rug) */
+export function furnitureReclamp(st, p) { wdClampPiece(st, p); }
 /** Put saved pieces (visit-store.js readFurniture, already whitelisted) on their rug cells; returns how many. Clamped into the
  *  furniture floor (the rug) only; never snapped to a real-room surface (rule 3). Each keeps p.saved until the player moves it. */
 export function furnitureRestore(st, saved, frame, floorY) {

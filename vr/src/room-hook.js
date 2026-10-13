@@ -19,13 +19,13 @@
 import { BoxGeometry, CanvasTexture, CircleGeometry, CylinderGeometry, DoubleSide, Group, InstancedMesh, Mesh, MeshBasicMaterial, Object3D, PlaneGeometry, RingGeometry, SRGBColorSpace, Vector3 } from 'three';
 const UP = new Vector3(0, 1, 0), tmpV = new Vector3();
 import { createCatBillboard, createSpriteCache } from './cat-billboard.js';
-import { createRoomBridge } from './room-bridge.js';
+import { createRoomBridge, GM_HOST_TUNING, GM_HOST_TEXT, grownArtFor } from './room-bridge.js';
 import { WAND_TUNING, furnitureKind, FURN_VR_TUNING } from './wand.js';
 import { boxAnim, FX_TUNING } from './fx.js';
 import { catArtDraw } from './cat-art.js';
 // P0a: Design's VR1 sprites (vr/public/art, loader vr/src/art/atlas.js) through the bundled slim manifest (no fetch; the
 // PNG atlases are build files loaded by three's TextureLoader). hi for the 3 nearest kittens, lo for the rest (pickLod).
-import { createAtlas } from './art/atlas.js';
+import { createAtlas, createMoveSeq, moveAnimFor } from './art/atlas.js';
 import { sheetTextureOrientation, bitmapFlipWorked, pickLodStable, checkArtCell } from './art-glue.js';
 import { ART_MANIFEST } from './art-manifest.gen.js';
 import { artIdOf, artPose, boxFaceUV, createResidency } from './art-glue.js';
@@ -35,6 +35,7 @@ import { Matrix4, Line, LineBasicMaterial, BufferGeometry, Float32BufferAttribut
 import { HUD_TUNING, hudLayout } from './hud-menu.js';
 import { TIP_TUNING } from './hints.js'; // GE2-B (Owner #2): the hint card is small, low + to the side, fades, any tap dismisses it
 import { DataTexture, ImageLoader, LinearFilter, RGBAFormat, Texture, UnsignedByteType } from 'three';
+import { SphereGeometry } from 'three'; // SK-PORT: the Yarn Tug pompom
 
 const BOX_SIZE_M = 0.28; // roomcat: boxR 0.14, boxH 0.3
 const CARD_W = 0.42, CARD_H = 0.12, CARD_AHEAD = 0.9, CARD_BELOW = 0.22; // head-locked hint card (metres)
@@ -86,6 +87,28 @@ function makeHudCanvas(w, h, px) {
   mesh.visible = false;
   return { mesh, tex, canvas, draw(fn) { const ctx = canvas.getContext('2d'); ctx.clearRect(0, 0, canvas.width, canvas.height); fn(ctx, canvas.width, canvas.height); tex.needsUpdate = true; } };
 }
+/** SK-PORT (WIRING 17): the looked-at kitten's needs as 4 small bars (0..100, higher = wants it more) with drawn icons (fish = Hunger,
+ *  yarn = Play, heart = Cuddle, Z = Sleepy; original vector shapes) in the strip's line-1 row from x0 to x1. Redrawn only on a 10 % step. */
+function hudNeedsBars(ctx, nd, x0, x1, H) {
+  ctx.save();
+  const nameW = (x1 - x0) * 0.28, cy = H * 0.3, gw = ((x1 - x0) - nameW) / 4;
+  ctx.fillStyle = '#fff3e6'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.font = `600 ${Math.round(H * 0.24)}px system-ui, sans-serif`;
+  ctx.fillText(String(nd.name || ''), x0, cy, nameW - H * 0.06);
+  const vals = [nd.hunger, nd.play, nd.cuddle, nd.sleepy], cols = ['#9fe3cf', '#ffb38a', '#ff9ec7', '#c9a7f5'], r = H * 0.09;
+  for (let i = 0; i < 4; i++) {
+    const gx = x0 + nameW + i * gw, ix = gx + r * 1.2, bx = gx + r * 2.6, bw = gw - r * 3.2, bh = H * 0.16;
+    ctx.fillStyle = cols[i]; ctx.strokeStyle = cols[i]; ctx.lineWidth = H * 0.035;
+    ctx.beginPath();
+    if (i === 0) { ctx.ellipse(ix - r * 0.2, cy, r * 0.8, r * 0.5, 0, 0, Math.PI * 2); ctx.moveTo(ix + r * 0.5, cy); ctx.lineTo(ix + r * 1.1, cy - r * 0.5); ctx.lineTo(ix + r * 1.1, cy + r * 0.5); ctx.closePath(); ctx.fill(); }
+    else if (i === 1) { ctx.arc(ix, cy, r * 0.8, 0, Math.PI * 2); ctx.stroke(); ctx.beginPath(); ctx.arc(ix - r * 0.9, cy - r * 0.2, r * 0.9, -0.6, 0.6); ctx.stroke(); }
+    else if (i === 2) { ctx.moveTo(ix, cy + r * 0.8); ctx.bezierCurveTo(ix - r * 1.4, cy - r * 0.2, ix - r * 0.5, cy - r * 1.2, ix, cy - r * 0.4); ctx.bezierCurveTo(ix + r * 0.5, cy - r * 1.2, ix + r * 1.4, cy - r * 0.2, ix, cy + r * 0.8); ctx.fill(); }
+    else { ctx.font = `700 ${Math.round(H * 0.22)}px system-ui, sans-serif`; ctx.textAlign = 'center'; ctx.fillText('z', ix, cy); ctx.textAlign = 'left'; }
+    ctx.fillStyle = 'rgba(255, 243, 230, 0.22)'; hudRound(ctx, bx, cy - bh / 2, bw, bh, bh / 2); ctx.fill();
+    const v = Math.max(0, Math.min(100, Number(vals[i]) || 0)) / 100;
+    if (v > 0) { ctx.fillStyle = cols[i]; hudRound(ctx, bx, cy - bh / 2, Math.max(bh, bw * v), bh, bh / 2); ctx.fill(); }
+  }
+  ctx.restore();
+}
 function hudRound(ctx, x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r); ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h); ctx.lineTo(x + r, y + h); ctx.quadraticCurveTo(x, y + h, x, y + h - r); ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y); ctx.closePath(); }
 
 /**
@@ -116,7 +139,7 @@ export function createRoomHook(opts = {}) {
   const residency = createResidency(8 * 1024 * 1024, 1.0);
   const onPerf = typeof opts.onPerf === 'function' ? opts.onPerf : null; // DEV smoke only: (what, detail) for every upload / free / card redraw / warm step
   const pinned = new Set(); // sheets uploaded by warm() before their first draw: kept through the stale sweep until drawn once (the budget still counts them)
-  const sheetBytes = (file) => (/\.lo\.png$/.test(file) ? M.lods.lo.gpuBytesPerCat : M.lods.hi.gpuBytesPerCat);
+  const sheetBytes = (file) => { const b = atlas.sheetGpuBytes ? atlas.sheetGpuBytes(file) : null; return b != null ? b : /\.lo\.png$/.test(file) ? M.lods.lo.gpuBytesPerCat : M.lods.hi.gpuBytesPerCat; }; // Q-GE2: an adult hi sheet (1024 x 512) = 2 MB
   const imgLoader = typeof document !== 'undefined' ? new ImageLoader() : null;
   // Quest fix (2026-10-10, the owner's "flashing parts in a rectangle"): WebGL ignores texture.flipY for an ImageBitmap source, so a
   // sheet must be decoded with imageOrientation 'flipY' and uploaded with flipY = false (art-glue sheetTextureOrientation). A
@@ -146,7 +169,7 @@ export function createRoomHook(opts = {}) {
       bitmapOk.then((ok) => { if (ok) createImageBitmap(img, sheetTextureOrientation('bitmap').bitmapOptions).then(keep, asImg); else asImg(); });
     }, undefined, () => images.delete(file));
   }
-  const todayIds = (opts.cats || []).map((c) => artIdOf(c && c.id != null ? c.id : c)).filter((id) => atlas && atlas.resolveCat(id));
+  const todayIds = (opts.cats || []).map((c) => grownArtFor(atlas, artIdOf(c && c.id != null ? c.id : c), c && c.size).artId).filter((id) => atlas && atlas.resolveCat(id)); // Q-GE2: a grown cat preloads its adult sheets
   const ltIds = atlas ? LT_ROOM_STARTERS.slice(0, HAPPY_TUNING.ltCats).filter((id) => atlas.resolveCat(id)) : [];
   if (atlas) for (const id of [...todayIds, ...ltIds]) for (const lod of ['lo', 'hi']) for (const f of atlas.sheetFiles(id, lod)) preloadImage(f);
   /** the RESIDENT texture for a sheet, uploading it from the decoded image if the budget allows; null = draw something else */
@@ -184,6 +207,113 @@ export function createRoomHook(opts = {}) {
   stick.visible = false; group.add(stick);
   const feather = new Mesh(new CircleGeometry(0.035, 12), new MeshBasicMaterial({ color: 0xff9ec7, side: DoubleSide, transparent: true, opacity: 0.95 }));
   feather.visible = false; group.add(feather);
+  // SK-PORT (Q-GE2): the Feather Pop feather (original canvas art: a curved quill with soft lilac vanes and a mint tip, drawn here) and the
+  // Yarn Tug strand (a 2-point line) + pompom bead. Built once; sync() only moves / shows them (no per-frame allocation).
+  const fpTex = (() => {
+    const c = document.createElement('canvas'); c.width = 64; c.height = 128; const g = c.getContext('2d');
+    g.clearRect(0, 0, 64, 128);
+    g.fillStyle = '#c9a7f5'; g.beginPath(); g.moveTo(32, 6); g.bezierCurveTo(58, 30, 54, 84, 34, 112); g.bezierCurveTo(12, 86, 8, 32, 32, 6); g.fill();
+    g.fillStyle = '#9fe3cf'; g.beginPath(); g.moveTo(32, 6); g.bezierCurveTo(44, 16, 44, 30, 33, 38); g.bezierCurveTo(22, 30, 22, 16, 32, 6); g.fill();
+    g.strokeStyle = 'rgba(255, 255, 255, 0.55)'; g.lineWidth = 2; for (let i = 0; i < 6; i++) { const y = 46 + i * 10; g.beginPath(); g.moveTo(33, y); g.lineTo(46 - i, y - 8); g.moveTo(33, y); g.lineTo(20 + i, y - 8); g.stroke(); }
+    g.strokeStyle = '#f6efe6'; g.lineWidth = 3; g.beginPath(); g.moveTo(32, 10); g.quadraticCurveTo(36, 70, 33, 124); g.stroke();
+    const t = new CanvasTexture(c); t.colorSpace = SRGBColorSpace; return t;
+  })();
+  const fpFeather = new Mesh(new PlaneGeometry(0.06, 0.12), new MeshBasicMaterial({ map: fpTex, transparent: true, side: DoubleSide, depthWrite: false }));
+  fpFeather.visible = false; group.add(fpFeather);
+  const tugLine = (() => { const g = new BufferGeometry(); g.setAttribute('position', new Float32BufferAttribute(new Float32Array(6), 3)); const l = new Line(g, new LineBasicMaterial({ color: 0xff9ec7 })); l.visible = false; l.frustumCulled = false; group.add(l); return l; })();
+  const tugBead = new Mesh(new SphereGeometry(0.025, 12, 8), new MeshBasicMaterial({ color: 0xffe08a })); tugBead.visible = false; group.add(tugBead);
+  // Q-GE2: the Games Master. PLACEHOLDER original silhouette (no VR sprite sheet for him exists yet): two stacked
+  // quads painted ONCE on canvases: the FUR layer (white, tinted by the fur colour: the sneeze crossfades only this tint) and the
+  // OUTFIT layer (purple jacket + top hat, bottle-green bow tie + band, small neon-green trim; never changes). The Oni mask is one
+  // small static quad (shown / hidden only, no flash); the distance ring is a faint floor ring around the player while he stalks;
+  // the Calm sneezes notice is one card painted once (text, "Keep calm sneezes" outlined as the default). No per-frame allocation.
+  const GM_W = 0.42, GM_H = 0.62;
+  const GM_FUR_RGB = { calico: [0.91, 0.64, 0.36], bengal: [0.79, 0.55, 0.25], marble: [0.66, 0.5, 0.34], mau: [0.62, 0.62, 0.6], polka: [0.95, 0.82, 0.45], stars: [0.36, 0.39, 0.64], splat: [0.48, 0.76, 0.7], glass: [0.68, 0.85, 0.92] };
+  const GM_FUR_ELSE = [0.8, 0.78, 0.74];
+  function gmCanvasTex(w, h, paint) {
+    if (typeof document === 'undefined') return null;
+    const c = document.createElement('canvas'); c.width = w; c.height = h; paint(c.getContext('2d'), w, h);
+    const t = new CanvasTexture(c); t.colorSpace = SRGBColorSpace; return t;
+  }
+  const gmPaintFur = (g) => { // white: tinted by the material colour
+    g.fillStyle = '#ffffff';
+    g.beginPath(); g.ellipse(128, 270, 66, 92, 0, 0, Math.PI * 2); g.fill();            // body (mostly under the jacket)
+    g.beginPath(); g.arc(128, 150, 50, 0, Math.PI * 2); g.fill();                         // head
+    g.beginPath(); g.moveTo(84, 128); g.lineTo(92, 82); g.lineTo(118, 110); g.fill();     // ear
+    g.beginPath(); g.moveTo(172, 128); g.lineTo(178, 96); g.lineTo(150, 108); g.fill();   // the folded ear
+    g.lineWidth = 14; g.strokeStyle = '#ffffff'; g.beginPath(); g.moveTo(186, 336); g.quadraticCurveTo(246, 300, 226, 214); g.stroke(); // tail
+    g.beginPath(); g.arc(226, 206, 18, 0, Math.PI * 2); g.fill();                        // poofy tuft
+    g.beginPath(); g.ellipse(100, 368, 22, 12, 0, 0, Math.PI * 2); g.ellipse(156, 368, 22, 12, 0, 0, Math.PI * 2); g.fill(); // paws
+  };
+  const gmPaintOutfit = (g) => {
+    g.fillStyle = '#7f3fe0'; g.beginPath(); g.moveTo(80, 214); g.lineTo(176, 214); g.lineTo(194, 356); g.lineTo(62, 356); g.closePath(); g.fill(); // jacket
+    g.fillStyle = '#4b1f8f'; g.beginPath(); g.moveTo(128, 222); g.lineTo(96, 216); g.lineTo(112, 290); g.closePath(); g.fill();
+    g.beginPath(); g.moveTo(128, 222); g.lineTo(160, 216); g.lineTo(144, 290); g.closePath(); g.fill();                                          // lapels
+    g.fillStyle = '#1f6b3a'; g.fillRect(62, 346, 132, 10);                                                                                       // hem
+    g.strokeStyle = '#7dff6a'; g.lineWidth = 2; g.beginPath(); g.moveTo(80, 214); g.lineTo(62, 356); g.moveTo(176, 214); g.lineTo(194, 356); g.stroke(); // piping
+    g.fillStyle = '#7dff6a'; for (const y of [300, 322]) { g.beginPath(); g.arc(128, y, 4, 0, Math.PI * 2); g.fill(); }                          // buttons
+    g.fillStyle = '#1f6b3a'; g.beginPath(); g.moveTo(128, 206); g.lineTo(106, 196); g.lineTo(106, 218); g.closePath(); g.moveTo(128, 206); g.lineTo(150, 196); g.lineTo(150, 218); g.closePath(); g.fill(); // bow tie
+    g.fillStyle = '#5a2aa8'; g.fillRect(70, 100, 116, 12);                                                                                       // hat brim
+    g.fillStyle = '#7f3fe0'; g.fillRect(90, 24, 76, 78);                                                                                         // crown
+    g.fillStyle = '#1f6b3a'; g.fillRect(90, 86, 76, 12);                                                                                         // band
+    g.strokeStyle = '#7dff6a'; g.lineWidth = 1.5; g.beginPath(); for (const x of [104, 128, 152]) { g.moveTo(x, 26); g.lineTo(x, 84); } g.stroke(); // pinstripe
+    g.fillStyle = '#2a1d33'; g.beginPath(); g.ellipse(110, 150, 7, 9, 0, 0, Math.PI * 2); g.ellipse(146, 150, 7, 9, 0, 0, Math.PI * 2); g.fill(); // eyes
+    g.fillStyle = '#ffffff'; g.beginPath(); g.moveTo(134, 176); g.lineTo(140, 176); g.lineTo(137, 186); g.closePath(); g.fill();                // one-fang smirk
+  };
+  const gmPaintMask = (g) => { // an original Oni-style festival mask: muted crimson, ivory horns, gold brows (static; no saturated red)
+    g.fillStyle = '#efe6cf'; g.beginPath(); g.moveTo(30, 34); g.lineTo(40, 2); g.lineTo(50, 30); g.moveTo(78, 30); g.lineTo(88, 2); g.lineTo(98, 34); g.fill();
+    g.fillStyle = '#b8443f'; g.beginPath(); g.ellipse(64, 70, 50, 54, 0, 0, Math.PI * 2); g.fill();
+    g.fillStyle = '#e0b040'; g.fillRect(28, 50, 30, 7); g.fillRect(70, 50, 30, 7);
+    g.fillStyle = '#2a1d33'; g.beginPath(); g.ellipse(44, 70, 9, 7, 0, 0, Math.PI * 2); g.ellipse(84, 70, 9, 7, 0, 0, Math.PI * 2); g.fill();
+    g.fillStyle = '#efe6cf'; g.fillRect(40, 96, 48, 8);
+  };
+  const gmGroup = new Group(); gmGroup.visible = false; group.add(gmGroup);
+  const gmFurMat = new MeshBasicMaterial({ map: gmCanvasTex(256, 384, gmPaintFur), transparent: true, depthWrite: false, side: DoubleSide, alphaTest: 0.05 });
+  const gmFur = new Mesh(new PlaneGeometry(GM_W, GM_H), gmFurMat); gmFur.position.y = GM_H / 2;
+  const gmOutfit = new Mesh(new PlaneGeometry(GM_W, GM_H), new MeshBasicMaterial({ map: gmCanvasTex(256, 384, gmPaintOutfit), transparent: true, depthWrite: false, side: DoubleSide, alphaTest: 0.05 }));
+  gmOutfit.position.set(0, GM_H / 2, 0.002);
+  const gmMask = new Mesh(new PlaneGeometry(0.15, 0.15), new MeshBasicMaterial({ map: gmCanvasTex(128, 128, gmPaintMask), transparent: true, depthWrite: false, side: DoubleSide }));
+  gmMask.position.set(0, GM_H * 0.62, 0.004); gmMask.visible = false;
+  gmGroup.add(gmFur, gmOutfit, gmMask);
+  const gmRing = new Mesh(new RingGeometry(GM_HOST_TUNING.oniRingM - 0.025, GM_HOST_TUNING.oniRingM, 48), new MeshBasicMaterial({ color: 0xc9b6ff, transparent: true, opacity: 0.3, depthWrite: false, side: DoubleSide }));
+  gmRing.rotation.x = -Math.PI / 2; gmRing.visible = false; group.add(gmRing);
+  const gmNotice = typeof document !== 'undefined' ? makeHudCanvas(GM_HOST_TUNING.noticeW, GM_HOST_TUNING.noticeH, 640) : null;
+  if (gmNotice) {
+    gmNotice.mesh.renderOrder = 999; group.add(gmNotice.mesh);
+    gmNotice.draw((g, W, H) => {
+      const N = GM_HOST_TEXT;
+      g.fillStyle = 'rgba(29, 22, 38, 0.9)'; hudRound(g, 0, 0, W, H, H * 0.08); g.fill();
+      g.fillStyle = '#fff3e6'; g.textAlign = 'left'; g.textBaseline = 'top'; g.font = `600 ${Math.round(H * 0.075)}px system-ui, sans-serif`;
+      const words = N.notice.split(' '), lh = H * 0.095; let line = '', y = H * 0.06;
+      for (const w of words) { const t = line ? line + ' ' + w : w; if (g.measureText(t).width > W * 0.9 && line) { g.fillText(line, W * 0.05, y); y += lh; line = w; } else line = t; }
+      if (line) g.fillText(line, W * 0.05, y);
+      const T2 = GM_HOST_TUNING, bw = W * 0.34, bh = H * 0.18, by = H * (0.5 - T2.btnDY / T2.noticeH) - bh / 2;
+      for (const [k, label] of [[-1, N.keep], [1, N.full]]) {
+        const bx = W * (0.5 + k * T2.btnDX / T2.noticeW) - bw / 2;
+        g.fillStyle = k < 0 ? '#ff9ec7' : 'rgba(255, 243, 230, 0.16)'; hudRound(g, bx, by, bw, bh, bh * 0.3); g.fill();
+        if (k < 0) { g.strokeStyle = '#fff3e6'; g.lineWidth = 4; hudRound(g, bx, by, bw, bh, bh * 0.3); g.stroke(); } // the default focus
+        g.fillStyle = k < 0 ? '#1d1626' : '#fff3e6'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.font = `700 ${Math.round(H * 0.07)}px system-ui, sans-serif`;
+        g.fillText(label, bx + bw / 2, by + bh / 2, bw * 0.92);
+      }
+    });
+  }
+  /** the host view (room-bridge result.gm) -> his quads, the mask, the ring, the notice card */
+  function syncGm(gm, head, tNow) {
+    if (!gm || !gm.on) { gmGroup.visible = false; gmRing.visible = false; if (gmNotice) gmNotice.mesh.visible = false; return; }
+    gmGroup.visible = true;
+    const p = gm.pose, hop = p === 'cheer' || p === 'trophy' ? 0.03 * Math.abs(Math.sin(tNow / 160)) : 0;
+    gmGroup.position.set(gm.x, gm.y + hop, gm.z);
+    if (head) gmGroup.rotation.set(0, Math.atan2(head.x - gm.x, head.z - gm.z), p === 'megaphone' || p === 'point' ? 0.08 : 0);
+    gmGroup.scale.set(1, p === 'nap' ? 0.85 : p === 'stalk' ? 0.92 : 1, 1);
+    const a = GM_FUR_RGB[gm.furFrom] || GM_FUR_ELSE, c = GM_FUR_RGB[gm.fur] || GM_FUR_ELSE, k = gm.fade >= 1 ? 1 : gm.fade <= 0 ? 0 : gm.fade;
+    gmFurMat.color.setRGB(a[0] + (c[0] - a[0]) * k, a[1] + (c[1] - a[1]) * k, a[2] + (c[2] - a[2]) * k);
+    gmMask.visible = !!gm.mask;
+    gmRing.visible = !!gm.ring.on; if (gmRing.visible) gmRing.position.set(gm.ring.x, gm.y + 0.005, gm.ring.z);
+    if (gmNotice) {
+      const N = gm.notice; gmNotice.mesh.visible = !!N.on;
+      if (N.on) { gmNotice.mesh.position.set(N.x, N.y, N.z); gmNotice.mesh.rotation.set(0, Math.atan2(-N.rz, N.rx), 0); } // faces the player (its +x = the card's right)
+    }
+  }
   // Q-GE2: furniture meshes, one Group per piece id (built once from its parts, dropped + disposed when the piece goes)
   const furnGroups = new Map(), furnSeen = new Set();
   const bin = new Mesh(new RingGeometry(FURN_VR_TUNING.binR * 0.75, FURN_VR_TUNING.binR, 32), new MeshBasicMaterial({ color: 0xe597b5, side: DoubleSide, transparent: true, opacity: 0.8 }));
@@ -341,7 +471,7 @@ export function createRoomHook(opts = {}) {
 
   function billboardFor(id, size) {
     let b = cats.get(id);
-    if (!b) { b = createCatBillboard({ cache, catId: id, size }); group.add(b.root); cats.set(id, b); }
+    if (!b) { b = createCatBillboard({ cache, catId: id, size }); const gs = grownArtFor(atlas, artIdOf(id), size).scale; if (gs !== 1) b.root.scale.setScalar(gs); group.add(b.root); cats.set(id, b); } // Q-GE2: adult art at scale 1.0; the kitten art x GROWN_TUNING.scale only when the cat has no adultId
     return b;
   }
 
@@ -411,25 +541,28 @@ export function createRoomHook(opts = {}) {
       const a0 = anim.get(c.id), spd = Number.isFinite(c.speed) ? c.speed : a0 ? a0.speed : 0; // Q-GE2: roomcat's eased speed first
       b.setMotion(spd, c.tell, c.stalk, t); // Q-GE2: rump wiggle / freeze squash / walk bob / play-bow (procedural, no art)
       // P0a: the atlas frame for (view, pose, time since this anim started, walk speed), hi / lo by distance rank
-      const pose = artPose(c.pose), aid = artIdOf(c.id);
+      let pose = artPose(c.pose); const ga = grownArtFor(atlas, artIdOf(c.id), c.size), aid = ga.artId; // Q-GE2: grown cat -> its adult art id
       let f = null;
       if (atlas && pose && atlas.resolveCat(aid)) {
         let a = anim.get(c.id);
-        if (!a) { a = { key: '', since: tNow, x: c.x, z: c.z, t: tNow, speed: 0, lod: 'hi', cyc: 0, ct: tNow }; anim.set(c.id, a); }
+        if (!a) { a = { kS: '', kA: '', since: tNow, x: c.x, z: c.z, t: tNow, speed: 0, lod: 'hi', cyc: 0, ct: tNow, seq: createMoveSeq() }; anim.set(c.id, a); }
         const dt = (tNow - a.t) / 1000; if (dt > 0.001) { const dx = c.x - a.x, dz = c.z - a.z; a.speed += (Math.sqrt(dx * dx + dz * dz) / dt - a.speed) * 0.3; a.x = c.x; a.z = c.z; a.t = tNow; }
-        const key = c.sprite + '|' + pose; if (key !== a.key) { a.key = key; a.since = tNow; a.cyc = 0; }
-        // Q-GE2 scurry fix: the walk cycle runs on its own clock, dt x the clamped speed scale, so easing never skips frames
+        // Q-GE2 move art: stalk / crouch / wiggle / launch / land / miss / run / bow from roomcat state, wiggle + launch only after stalk + crouch
+        pose = moveAnimFor(a.seq, c, pose);
+        if (c.sprite !== a.kS || pose !== a.kA) { a.kS = c.sprite; a.kA = pose; a.since = tNow; a.cyc = 0; } // (two compares: no key string per frame)
+        // Q-GE2 scurry fix: walk / run / stalk cycles run on their own clock, dt x the clamped speed scale, so easing never skips frames; the stalk FREEZE stops it (holds the frame)
         const sp = Number.isFinite(c.speed) ? c.speed : a.speed, cdt = Math.min(0.1, Math.max(0, (tNow - a.ct) / 1000)); a.ct = tNow;
-        a.cyc += cdt * atlas.fpsScale(pose, sp);
+        // Q-GE2: adult art carries its own animOverride fps (inside the atlas): ga.fpsX = idleFpsX = 1; the x1.7 kitten-art fallback keeps the slower cycle
+        if (!a.seq.hold) a.cyc += cdt * atlas.fpsScale(pose, sp * ga.fpsX, aid, c.sprite);
         // LOD by distance only (Design 11:2x): hi within 2.5 m, lo beyond
         if (head && tNow - lodT > 500) { a.lod = pickLodStable(Math.sqrt((head.x - c.x) ** 2 + (head.z - c.z) ** 2), a.lod); } // hysteresis: no hi <-> lo churn at the 2.5 m line
         // cat-views decides the sprite sheet (side / front / back / above / below) + the mirror (flipX = the heading points to the
         // camera's left) + rotDeg for the top view; the atlas only supplies the frame (side art faces right, top art head +x)
-        f = atlas.getFrame(aid, c.sprite, pose, (tNow - a.since) / 1000, { lod: a.lod, speedMps: sp, cycleT: a.cyc, flipX: !!c.flipX });
+        f = atlas.getFrame(aid, c.sprite, pose, (tNow - a.since) / 1000 * ga.idleFpsX, { lod: a.lod, speedMps: sp, cycleT: a.cyc, flipX: !!c.flipX });
       }
       let ftex = f ? drawTexture(f.file, t) : null;
       if (f && !ftex) { // this sheet is not drawable yet (still decoding / no GPU room): the other lod, else the canvas sprite
-        const g = atlas.getFrame(aid, c.sprite, pose, (tNow - anim.get(c.id).since) / 1000, { lod: f.lod === 'hi' ? 'lo' : 'hi', speedMps: Number.isFinite(c.speed) ? c.speed : anim.get(c.id).speed, cycleT: anim.get(c.id).cyc, flipX: !!c.flipX });
+        const g = atlas.getFrame(aid, c.sprite, pose, (tNow - anim.get(c.id).since) / 1000 * ga.idleFpsX, { lod: f.lod === 'hi' ? 'lo' : 'hi', speedMps: Number.isFinite(c.speed) ? c.speed : anim.get(c.id).speed, cycleT: anim.get(c.id).cyc, flipX: !!c.flipX });
         const gt = g ? drawTexture(g.file, t) : null; if (gt) { f = g; ftex = gt; }
       }
       if (f && ftex) { b.setAtlasFrame(f, ftex); const a = anim.get(c.id); if (a) { const sh = a.shown || (a.shown = {}); sh.cat = f.cat; sh.view = f.view; sh.anim = f.anim; sh.index = f.index; sh.count = f.count; sh.sheet = f.sheet; sh.lod = f.lod; sh.file = f.file; sh.rect = f.rect; sh.uv = f.uv; sh.flipX = f.flipX; sh.flipY = ftex.flipY; sh.kind = imageKind(ftex.image); sh.sprite = c.sprite; sh.pose = pose; } } // CG NIT: reuse the record (no per-kitten object per frame)
@@ -479,7 +612,9 @@ export function createRoomHook(opts = {}) {
           const bw = W * HT.btnW / HT.stripW;
           ctx.fillStyle = 'rgba(29, 22, 38, 0.86)'; hudRound(ctx, 0, 0, W - bw - 6, H, H * 0.22); ctx.fill();
           ctx.fillStyle = '#fff3e6'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-          ctx.font = `700 ${Math.round(H * 0.36)}px system-ui, sans-serif`; ctx.fillText(hud.stats.line1, H * 0.25, H * 0.3, W - bw - H * 0.5);
+          const nd = hud.stats.needs, textW = W - bw - H * 0.5;
+          ctx.font = `700 ${Math.round(H * 0.36)}px system-ui, sans-serif`; ctx.fillText(hud.stats.line1, H * 0.25, H * 0.3, nd ? textW * 0.42 : textW);
+          if (nd) hudNeedsBars(ctx, nd, H * 0.25 + textW * 0.45, W - bw - 6 - H * 0.15, H); // SK-PORT (WIRING 17): Kitten Needs, 4 small bars
           ctx.font = `600 ${Math.round(H * 0.32)}px system-ui, sans-serif`; ctx.fillText(hv.hoverTip || hud.stats.line2, H * 0.25, H * 0.72, W - bw - H * 0.5); // the hovered tile's tip replaces line 2
           ctx.fillStyle = hv.button.hover ? '#fff3e6' : hv.open ? '#ff9ec7' : 'rgba(29, 22, 38, 0.86)'; hudRound(ctx, W - bw, 0, bw, H, H * 0.22); ctx.fill();
           ctx.strokeStyle = '#ff9ec7'; ctx.lineWidth = H * 0.06; hudRound(ctx, W - bw + 2, 2, bw - 4, H - 4, H * 0.2); ctx.stroke();
@@ -492,15 +627,17 @@ export function createRoomHook(opts = {}) {
         const cu = HT.stripH / 2 + HT.gap + HL.gridH / 2; // the grid centre sits this far above the strip centre
         hudTiles.mesh.quaternion.copy(hudStrip.mesh.quaternion);
         hudTiles.mesh.position.set(P.c.x + P.u.x * cu, P.c.y + P.u.y * cu, P.c.z + P.u.z * cu); hudTiles.mesh.visible = true;
-        let tk = hv.page || ''; for (const t of hv.tiles) tk += t.id + (t.hover ? 'h' : '-') + (t.pressed ? 'p' : '-') + (t.active ? 'a' : '-') + (t.disabled ? 'd' : '-');
+        let tk = hv.page || ''; for (const t of hv.tiles) tk += t.id + (t.hover ? 'h' : '-') + (t.pressed ? 'p' : '-') + (t.active ? 'a' : '-') + (t.disabled ? 'd' : '-') + (t.hint ? 'n' : '-');
         if (tk !== hudTilesKey) {
           hudTilesKey = tk;
           hudTiles.draw((ctx, W, H) => {
             const sx = W / HL.gridW, sy = H / HL.gridH;
             for (const t of hv.tiles) {
+              if (!t.id) continue; // SK-PORT: an empty picker slot is not drawn
               const x = (t.u - HT.tileW / 2 + HL.gridW / 2) * sx, y = (HL.gridH / 2 - (t.v - (HT.stripH / 2 + HT.gap + HL.gridH / 2)) - HT.tileH / 2) * sy, w = HT.tileW * sx, h = HT.tileH * sy;
               ctx.globalAlpha = t.disabled ? 0.45 : 1;
               ctx.fillStyle = t.pressed ? '#ffd1e3' : t.active ? '#ff9ec7' : t.hover ? '#4a3a5c' : 'rgba(29, 22, 38, 0.9)'; hudRound(ctx, x, y, w, h, h * 0.18); ctx.fill();
+              if (t.hint && !t.hover) { ctx.strokeStyle = '#ffe08a'; ctx.lineWidth = h * 0.07; ctx.setLineDash([h * 0.12, h * 0.08]); hudRound(ctx, x + h * 0.04, y + h * 0.04, w - h * 0.08, h - h * 0.08, h * 0.16); ctx.stroke(); ctx.setLineDash([]); } // SK-PORT: the Kitten Needs hint
               if (t.hover) { ctx.strokeStyle = '#fff3e6'; ctx.lineWidth = h * 0.08; hudRound(ctx, x + h * 0.04, y + h * 0.04, w - h * 0.08, h - h * 0.08, h * 0.16); ctx.stroke(); }
               ctx.fillStyle = t.active || t.pressed ? '#1d1626' : '#fff3e6'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
               ctx.font = `700 ${Math.round(h * 0.26)}px system-ui, sans-serif`; ctx.fillText(t.label, x + w / 2, y + h * 0.42, w * 0.9);
@@ -522,6 +659,19 @@ export function createRoomHook(opts = {}) {
     } else { hudStrip.mesh.visible = false; hudTiles.mesh.visible = false; hudCursors.left.visible = false; hudCursors.right.visible = false; hudBeams.left.visible = false; hudBeams.right.visible = false; }
     // Q-GE2 (owner #7): placed furniture (wand.js pieces: F1 / B5 original art as boxes + cylinders) and the bin ring
     syncFurniture(result.furniture);
+    // SK-PORT (WIRING 8 / 13): the Feather Pop feather over its dot (a gentle bob, turned to the head) and the Yarn Tug strand + pompom
+    const fp = result.featherPop;
+    if (fp && fp.up) {
+      const f = fp.feather; fpFeather.visible = true; fpFeather.position.set(f.x, f.y + 0.07 + 0.012 * Math.sin(tNow / 260), f.z);
+      if (head) fpFeather.rotation.set(0, Math.atan2(head.x - f.x, head.z - f.z), 0.25 * Math.sin(tNow / 410));
+    } else fpFeather.visible = false;
+    const tg = result.tug;
+    if (tg && tg.on) {
+      const a = tugLine.geometry.attributes.position; a.setXYZ(0, tg.cat.x, tg.cat.y, tg.cat.z); a.setXYZ(1, tg.hand.x, tg.hand.y, tg.hand.z); a.needsUpdate = true; tugLine.visible = true;
+      const k = Math.max(0, Math.min(1, tg.t)); tugBead.visible = true;
+      tugBead.position.set(tg.cat.x + (tg.hand.x - tg.cat.x) * k, tg.cat.y + (tg.hand.y - tg.cat.y) * k, tg.cat.z + (tg.hand.z - tg.cat.z) * k);
+    } else { tugLine.visible = false; tugBead.visible = false; }
+    syncGm(result.gm, head, tNow); // Q-GE2: the Games Master (placeholder art)
     // W3: wand + basket (wand.js view)
     const w = result.wand;
     if (w) {
@@ -550,7 +700,7 @@ export function createRoomHook(opts = {}) {
     } else {
       const lines = [];
       if (result.hint) for (const l of String(result.hint.text).split('\n')) lines.push(l); // a two-line hint = two card lines at full size
-      if (result.caption) lines.push(result.caption);
+      if (result.caption) for (const l of String(result.caption).split('\n')) lines.push(l); // a two-line caption (the host's line 1 + 2) = two card lines
       const key = lines.join('\n');
       if (key !== cardLines) { cardLines = key; card.draw(lines, false); card.mesh.visible = lines.length > 0; if (onPerf) onPerf('card', { which: 'hint', lines: lines.length }); }
       const tc = result.tipCard;
@@ -579,6 +729,8 @@ export function createRoomHook(opts = {}) {
     box.traverse((o) => freeObject(o)); group.remove(box);
     if (whiteTex) whiteTex.dispose(); // N1
     laser.traverse((o) => freeObject(o)); group.remove(laser);
+    for (const o of [fpFeather, tugLine, tugBead]) { group.remove(o); freeObject(o); } // SK-PORT
+    gmGroup.traverse((o) => freeObject(o)); group.remove(gmGroup); group.remove(gmRing); freeObject(gmRing); if (gmNotice) { group.remove(gmNotice.mesh); freeObject(gmNotice.mesh); } // Q-GE2
     group.remove(targetRing); freeObject(targetRing);
     for (const kind in pools) { group.remove(pools[kind]); freeObject(pools[kind]); if (typeof pools[kind].dispose === 'function') pools[kind].dispose(); }
     meter.traverse((o) => freeObject(o)); group.remove(meter);

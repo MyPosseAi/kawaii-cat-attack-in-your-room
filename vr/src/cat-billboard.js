@@ -142,7 +142,7 @@ export const GAIT = Object.freeze({
   bobM: 0.0025, bobStrideM: 0.3, bobMinMps: 0.03, // walk / run body bob: 2-3 mm, two bumps per cycle of 0.3 m
   wiggleDeg: 8, wiggleHz: 8,                      // rump wiggle while roomcat tell.phase === 'wiggle' (phase from tell.s)
   freezeSquash: 0.9, freezeSquashCanvas: 0.8,     // slight squash on stalk 'freeze' and the tell 'settle' (canvas: crouch depth)
-  bowS: 1.2, bowDeg: 9, bowSquash: 0.85, bowStretch: 1.06, // stretch = a play-bow: front down, rump up, then slow rise
+  bowS: 1.2, bowDeg: 9, bowSquash: 0.85, bowStretch: 1.06, // stretch = a play-bow: front down, rump up, then slow rise (canvas / old art only: Design's bow frames replace it)
 });
 const MOTION_POSES_WALK = new Set(['walk', 'run', 'trot']);
 const SIDE_SPRITES = new Set(['side', 'left', 'right']);
@@ -257,7 +257,7 @@ export function createCatBillboard(opts = {}) {
       const bob = bobPh ? GAIT.bobM * Math.abs(Math.sin(Math.PI * 2 * bobPh)) : 0;
       const wig = tell && tell.phase === 'wiggle' ? GAIT.wiggleDeg * DEG2RAD * Math.sin(Math.PI * 2 * GAIT.wiggleHz * (Number(tell.s) || 0)) : 0;
       const frz = stalk === 'freeze' || !!(tell && tell.phase === 'settle');
-      if (pose === 'stretch') { if (bowSince == null) bowSince = ts; const k = (ts - bowSince) / GAIT.bowS; bowE = k >= 1 ? 0 : Math.sin(Math.PI * Math.max(0, k)); }
+      if (pose === 'stretch' && !(frame && frame.anim === 'bow')) { if (bowSince == null) bowSince = ts; const k = (ts - bowSince) / GAIT.bowS; bowE = k >= 1 ? 0 : Math.sin(Math.PI * Math.max(0, k)); }
       else { bowSince = null; bowE = 0; }
       const sy = 1 - (1 - GAIT.bowSquash) * bowE, sx = 1 + (GAIT.bowStretch - 1) * bowE;
       if (bob !== mBob || wig !== mRz || frz !== mFreeze || sy !== mSy || sx !== mSx || bowE > 0) { mBob = bob; mRz = wig; mFreeze = frz; mSy = sy; mSx = sx; apply(); }
@@ -288,7 +288,7 @@ export function createCatBillboard(opts = {}) {
     setShadow(y, alpha) {
       if (y == null || !(alpha > 0)) { shadow.visible = false; return; }
       shadow.visible = true;
-      shadow.position.y = y - root.position.y + 0.002;
+      shadow.position.y = (y - root.position.y) / (root.scale.y || 1) + 0.002; // (local units: a grown cat's root is scaled, Q-GE2)
       shadow.material.opacity = 0.28 * alpha;
       const s = 1 + Math.max(0, root.position.y - y) * 0.6; // a higher cat throws a bigger, fainter blob
       shadow.scale.set(s, 0.55 * s, 1);

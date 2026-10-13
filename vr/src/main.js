@@ -21,6 +21,7 @@ import projectOptions from 'virtual:iwsdk-project';
 import { Vector3 } from 'three';
 import { createCatBillboard } from './cat-billboard.js';
 import { createRoomHook } from './room-hook.js';
+import { grownMix } from './room-bridge.js'; // Q-GE2: 1-2 grown starter cats join the kittens
 import { inputKinds, readHands, readWebXRScene } from './room-bridge.js';
 import { createSessionLife } from './session-life.js';
 import { beginVisit, readFurniture, writeFurniture } from './visit-store.js';
@@ -51,7 +52,7 @@ function startVisit() {
   log(`visit ${v.visit}${v.isNew ? ' (new kitten in the box)' : ''}, ${today.count} kittens${remembered ? `, ${remembered} remembered` : ''}${v.persisted ? '' : ' (no local save: no "tomorrow" promise)'}`);
   // /: the toy furniture on the play rug (kind + 10 cm rug cell + 45 deg step, max 12; gate FURNITURE_PERSIST)
   const furniture = readFurniture(visitStorage());
-  return { visit: v.visit, persisted: v.persisted, cats: today.ids.map((id) => ({ id, size: 'kitten' })), memory, furniture };
+  return { visit: v.visit, persisted: v.persisted, cats: grownMix(today.ids.map((id) => ({ id, size: 'kitten' })), ROSTER, SESSION_SEED, v.visit), memory, furniture };
 }
 /** The bridge's rug list -> the visit record (whitelisted on write; nothing when the gate is closed). */
 function saveFurniture(f) { writeFurniture(visitStorage(), f, undefined, undefined, ROSTER); }
